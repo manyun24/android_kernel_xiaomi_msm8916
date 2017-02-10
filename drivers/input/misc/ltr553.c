@@ -35,6 +35,10 @@
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
 
+#ifdef CONFIG_PSENSOR_ONDEMAND_STATE
+#include <linux/input/ltr553.h>
+#endif
+
 #define LTR553_I2C_NAME			"ltr553"
 #define LTR553_LIGHT_INPUT_NAME		"ltr553-light"
 #define LTR553_PROXIMITY_INPUT_NAME	"ltr553-proximity"
