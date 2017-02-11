@@ -1,2431 +1,2024 @@
-/* Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
+/* ltr559.c
+ * LTR-On LTR-559 Proxmity and Light sensor driver
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
+ * Copyright (C) 2011 Lite-On Technology Corp (Singapore)
+ * Copyright (C) 2016 XiaoMi, Inc.
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
+ *
+ */
+/*
+ *  2011-11-18 Thundersoft porting to MSM7x27A platform.
+ *  2011-05-01 Lite-On created base driver.
  */
 
+#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/jiffies.h>
 #include <linux/i2c.h>
-#include <linux/i2c-dev.h>
-#include <linux/miscdevice.h>
-#include <linux/mutex.h>
-#include <linux/mm.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/delay.h>
-#include <linux/sysctl.h>
-#include <linux/regulator/consumer.h>
-#include <linux/input.h>
-#include <linux/regmap.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
 #include <linux/interrupt.h>
-#include <linux/sensors.h>
-#include <linux/pm_wakeup.h>
+#include <linux/sysfs.h>
+#include <linux/delay.h>
+#include <linux/platform_device.h>
+#include <linux/err.h>
+#include <linux/input.h>
+#include <linux/jiffies.h>
 #include <linux/uaccess.h>
-#include <linux/atomic.h>
+#include <linux/miscdevice.h>
 
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-#include <linux/input/ltr553.h>
+
+#include <linux/mutex.h>
+#include <linux/ctype.h>
+#include <linux/pm_runtime.h>
+#include <linux/device.h>
+#include <linux/input/ltr559.h>
+#include <linux/irq.h>
+#include <linux/of_gpio.h>
+#include <linux/sensors.h>
+#include <linux/regulator/consumer.h>
+#include <linux/wakelock.h>
+
+#define SENSOR_NAME			"proximity"
+#define LTR559_DRV_NAME		"ltr559"
+#define LTR559_MANUFAC_ID	0x05
+
+#define VENDOR_NAME				"lite-on"
+#define LTR559_SENSOR_NAME		"ltr559als"
+#define DRIVER_VERSION		"1.0"
+
+#define ALSPS_LS_ENABLE	_IOW('c', 5, int *)
+#define ALSPS_PS_ENABLE	_IOW('c', 6, int *)
+#define ALSPS_LSENSOR_LUX_DATA	_IOW('c', 7, int *)
+#define ALSPS_PSENSOR_ABS_DISTANCE_DATA	_IOW('c', 8, int *)
+#define ALSPS_GET_PS_RAW_DATA_FOR_CALI	_IOW('c', 9, int *)
+#define ALSPS_REC_PS_DATA_FOR_CALI	_IOW('c', 10, int *)
+
+#define DYNAMIC_CALIBRATE 1
+
+
+#if defined(CONFIG_L6140_COMMON) || defined(CONFIG_L6300_COMMON)
+#define SYS_AUTHORITY_FOR_CTS
 #endif
 
-#define LTR553_I2C_NAME			"ltr553"
-#define LTR553_LIGHT_INPUT_NAME		"ltr553-light"
-#define LTR553_PROXIMITY_INPUT_NAME	"ltr553-proximity"
+#ifdef SYS_AUTHORITY_FOR_CTS
+#define SYS_AUTHORITY		(S_IRUGO|S_IWUSR|S_IWGRP)
+#else
+#define SYS_AUTHORITY		(S_IRUGO|S_IWUGO)
+#endif
 
-#define LTR553_REG_ALS_CTL		0x80
-#define LTR553_REG_PS_CTL		0x81
-#define LTR553_REG_PS_LED		0x82
-#define LTR553_REG_PS_N_PULSES		0x83
-#define LTR553_REG_PS_MEAS_RATE		0x84
-#define LTR553_REG_ALS_MEAS_RATE	0x85
-#define LTR553_REG_PART_ID		0x86
-#define LTR553_REG_ALS_DATA_CH1_0	0x88
-#define LTR553_REG_ALS_DATA_CH1_1	0x89
-#define LTR553_REG_ALS_DATA_CH0_0	0x8A
-#define LTR553_REG_ALS_DATA_CH0_1	0x8B
-#define LTR553_REG_ALS_PS_STATUS	0x8C
-#define LTR553_REG_PS_DATA_0		0x8D
-#define LTR553_REG_INTERRUPT		0x8F
-#define LTR553_REG_PS_THRES_UP_0	0x90
-#define LTR553_REG_PS_OFFSET_1		0x94
-#define LTR553_REG_PS_OFFSET_0		0x95
-#define LTR553_REG_ALS_THRES_UP_0	0x97
-#define LTR553_REG_INTERRUPT_PERSIST	0x9E
-#define LTR553_REG_MAGIC		0xFF
 
-#define LTR553_PART_ID			0x92
 
-#define LTR553_ALS_SENSITIVITY		70
+#ifdef DEBUG
+#define wing_info(fmt, ...) \
+	printk("[wingtech] %s: "pr_fmt(fmt), __FUNCTION__, ##__VA_ARGS__)
+#else
+#define wing_info(fmt, ...)
+#endif
 
-#define LTR553_BOOT_TIME_MS		120
-#define LTR553_WAKE_TIME_MS		10
-#define LTR553_ONDEMAND_WAKE_TIME_MS	10
+struct ltr559_data {
 
-#define LTR553_PS_SATURATE_MASK		0x8000
-#define LTR553_ALS_INT_MASK		0x08
-#define LTR553_PS_INT_MASK		0x02
+	struct i2c_client *client;
+	struct input_dev *input_dev_als;
+	struct input_dev *input_dev_ps;
+	struct sensors_classdev als_cdev;
+	struct sensors_classdev ps_cdev;
 
-#define LTR553_ALS_MEASURE_MASK		0x38
-#define LTR553_ALS_GAIN_MASK		0x1c
+	struct wake_lock ps_wakelock;
 
-/* default measurement rate is 100 ms */
-#define LTR553_ALS_DEFAULT_MEASURE_RATE	0x01
-#define LTR553_PS_MEASUREMENT_RATE_10MS	0x08
+	/* pinctrl data*/
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *pin_default;
+	struct pinctrl_state *pin_sleep;
 
-#define LTR553_CALIBRATE_SAMPLES	15
+	struct ltr559_platform_data *platform_data;
 
-#define ALS_GAIN_SWITCH_THRESHOLD	60000
+	/* regulator data */
+	bool power_state;
+	struct regulator *vdd;
+	struct regulator *vio;
 
-#define LTR553_ALS_INVALID(value)	(value & 0x80)
+	/* interrupt type is level-style */
+	struct mutex lockw;
+	struct mutex op_lock;
 
-/* LTR553 ALS data is 16 bit */
-#define ALS_DATA_MASK			0xffff
-#define ALS_LOW_BYTE(data)		((data) & 0xff)
-#define ALS_HIGH_BYTE(data)		(((data) >> 8) & 0xff)
+	struct delayed_work ps_work;
+	struct delayed_work als_work;
 
-/* LTR553 PS data is 11 bit */
-#define PS_DATA_MASK			0x7ff
-#define PS_LOW_BYTE(data)		((data) & 0xff)
-#define PS_HIGH_BYTE(data)		(((data) >> 8) & 0x7)
+	u8 ps_open_state;
+	u8 als_open_state;
 
-/* Calculated by 10% transmittance */
-#define LTR553_MAX_LUX			(ALS_DATA_MASK * 10)
+	u16 irq;
 
-/* both als and ps interrupt are enabled */
-#define LTR553_INTERRUPT_SETTING	0x03
+	u32 ps_state;
+	u32 last_lux;
+#if defined(DYNAMIC_CALIBRATE)
+	bool cali_update;
+	u32 dynamic_noise;
+#endif
+};
+struct ltr559_data *sensor_info;
 
-/* Any proximity distance change will wakeup SoC */
-#define LTR553_WAKEUP_ANY_CHANGE	0xff
-
-#define CAL_BUF_LEN			16
-enum {
-	CMD_WRITE = 0,
-	CMD_READ = 1,
+struct ltr559_reg {
+	const char *name;
+	u8 addr;
+	u16 defval;
+	u16 curval;
 };
 
-struct regulator_map {
-	struct regulator	*regulator;
-	int			min_uv;
-	int			max_uv;
-	char			*supply;
+enum ltr559_reg_tbl{
+	REG_ALS_CONTR,
+	REG_PS_CONTR,
+	REG_ALS_PS_STATUS,
+	REG_INTERRUPT,
+	REG_PS_LED,
+	REG_PS_N_PULSES,
+	REG_PS_MEAS_RATE,
+	REG_ALS_MEAS_RATE,
+	REG_MANUFACTURER_ID,
+	REG_INTERRUPT_PERSIST,
+	REG_PS_THRES_LOW,
+	REG_PS_THRES_UP,
+	REG_ALS_THRES_LOW,
+	REG_ALS_THRES_UP,
+	REG_ALS_DATA_CH1,
+	REG_ALS_DATA_CH0,
+	REG_PS_DATA
 };
 
-struct pinctrl_config {
-	struct pinctrl		*pinctrl;
-	struct pinctrl_state	*state[2];
-	char			*name[2];
-};
+static int ltr559_als_set_enable(struct sensors_classdev *sensors_cdev,
+		unsigned int enable);
+static int ltr559_ps_set_enable(struct sensors_classdev *sensors_cdev,
+		unsigned int enable);
 
-struct ltr553_data {
-	struct i2c_client	*i2c;
-	struct regmap		*regmap;
-	struct regulator	*config;
-	struct input_dev	*input_light;
-	struct input_dev	*input_proximity;
-	struct workqueue_struct	*workqueue;
+#if defined(DYNAMIC_CALIBRATE)
+static ssize_t ltr559_ps_dynamic_caliberate_init(struct i2c_client *client, struct sensors_classdev *sensors_cdev);
+#endif
 
-	struct sensors_classdev	als_cdev;
-	struct sensors_classdev	ps_cdev;
-	struct mutex		ops_lock;
-	ktime_t			last_als_ts;
-	ktime_t			last_ps_ts;
-	struct work_struct	report_work;
-	struct work_struct	als_enable_work;
-	struct work_struct	als_disable_work;
-	struct work_struct	ps_enable_work;
-	struct work_struct	ps_disable_work;
-	atomic_t		wake_count;
-
-	int			irq_gpio;
-	int			irq;
-	bool			als_enabled;
-	bool			ps_enabled;
-	u32			irq_flags;
-	int			als_delay;
-	int			ps_delay;
-	int			als_cal;
-	int			ps_cal;
-	int			als_gain;
-	int			als_persist;
-	int			als_integration_time;
-	int			als_measure_rate;
-	int			ps_led;
-	int			ps_pulses;
-	int			ps_measure_rate;
-	int			als_ps_persist;
-	int			ps_wakeup_threshold;
-
-	int			last_als;
-	int			last_ps;
-	int			flush_count;
-	int			power_enabled;
-
-	unsigned int		reg_addr;
-	char			calibrate_buf[CAL_BUF_LEN];
-	unsigned int		bias;
-};
-
-struct als_coeff {
-	int ch0_coeff_i;
-	int ch1_coeff_i;
-	int ch0_coeff_f;
-	int ch1_coeff_f;
-	int win_fac;
-	int sign;
-} __attribute__((__packed__));
-
-static struct regulator_map power_config[] = {
-	{.supply = "vdd", .min_uv = 2000000, .max_uv = 3300000, },
-	{.supply = "vio", .min_uv = 1750000, .max_uv = 1950000, },
-};
-
-static struct pinctrl_config pin_config = {
-	.name = { "default", "sleep" },
-};
-
-static struct als_coeff eqtn_map[] = {
+static  struct ltr559_reg reg_tbl[] = {
 	{
-		.ch0_coeff_i = 1,
-		.ch1_coeff_i = 1,
-		.ch0_coeff_f = 7743,
-		.ch1_coeff_f = 1059,
-		.win_fac = 44,
-		.sign = 1,
+		.name   = "ALS_CONTR",
+		.addr   = 0x80,
+		.defval = 0x00,
+		.curval = 0x0D,
 	},
 	{
-		.ch0_coeff_i = 4,
-		.ch1_coeff_i = 1,
-		.ch0_coeff_f = 2785,
-		.ch1_coeff_f = 9548,
-		.win_fac = 50,
-		.sign = -1,
+		.name = "PS_CONTR",
+		.addr = 0x81,
+		.defval = 0x00,
+		.curval = 0x03,
 	},
 	{
-		.ch0_coeff_i = 0,
-		.ch1_coeff_i = 0,
-		.ch0_coeff_f = 5926,
-		.ch1_coeff_f = 1185,
-		.win_fac = 40,
-		.sign = 1,
+		.name = "ALS_PS_STATUS",
+		.addr = 0x8c,
+		.defval = 0x00,
+		.curval = 0x00,
 	},
 	{
-		.ch0_coeff_i = 0,
-		.ch1_coeff_i = 0,
-		.ch0_coeff_f = 0,
-		.ch1_coeff_f = 0,
-		.win_fac = 1,
-		.sign = 1,
+		.name = "INTERRUPT",
+		.addr = 0x8f,
+		.defval = 0x00,
+		.curval = 0x01,
+	},
+
+#if defined(CONFIG_L6140_COMMON) || defined(CONFIG_L6300_COMMON)
+	{
+		.name = "PS_LED",
+		.addr = 0x82,
+		.defval = 0x7f,
+		.curval = 0x1f,
+	},
+	{
+		.name = "PS_N_PULSES",
+		.addr = 0x83,
+		.defval = 0x01,
+		.curval = 0x0f,
+	},
+#else
+	{
+		.name = "PS_LED",
+		.addr = 0x82,
+		.defval = 0x7f,
+		.curval = 0x7b,
+	},
+	{
+		.name = "PS_N_PULSES",
+		.addr = 0x83,
+		.defval = 0x01,
+		.curval = 0x02,
+	},
+#endif
+	{
+		.name = "PS_MEAS_RATE",
+		.addr = 0x84,
+		.defval = 0x02,
+		.curval = 0x08,
+	},
+	{
+		.name = "ALS_MEAS_RATE",
+		.addr = 0x85,
+
+
+		.defval = 0x03,
+		.curval = 0x01,
+	},
+	{
+		.name = "MANUFACTURER_ID",
+		.addr = 0x87,
+		.defval = 0x05,
+		.curval = 0x05,
+	},
+	{
+		.name = "INTERRUPT_PERSIST",
+		.addr = 0x9e,
+		.defval = 0x00,
+		.curval = 0x23,
+	},
+	{
+		.name = "PS_THRES_LOW",
+		.addr = 0x92,
+		.defval = 0x0000,
+		.curval = 0x0000,
+	},
+	{
+		.name = "PS_THRES_UP",
+		.addr = 0x90,
+		.defval = 0x07ff,
+		.curval = 0x0000,
+	},
+	{
+		.name = "ALS_THRES_LOW",
+		.addr = 0x99,
+		.defval = 0x0000,
+		.curval = 0x0000,
+	},
+	{
+		.name = "ALS_THRES_UP",
+		.addr = 0x97,
+		.defval = 0xffff,
+
+		.curval = 0x0000,
+	},
+	{
+		.name = "ALS_DATA_CH1",
+		.addr = 0x88,
+		.defval = 0x0000,
+		.curval = 0x0000,
+	},
+	{
+		.name = "ALS_DATA_CH0",
+		.addr = 0x8a,
+		.defval = 0x0000,
+		.curval = 0x0000,
+	},
+	{
+		.name = "PS_DATA",
+		.addr = 0x8d,
+		.defval = 0x0000,
+		.curval = 0x0000,
 	},
 };
 
-/* ALS integration time in 10ms */
-static int als_int_fac_table[] = { 10, 5, 20, 40, 15, 25, 30, 35 };
-/* ALS gain table, index 4 & 5 are reserved */
-static int als_gain_table[] = {1, 2, 4, 8, 1, 1, 48, 96};
-/* ALS measurement repeat rate in ms */
-static int als_mrr_table[] = {50, 100, 200, 500, 1000, 2000, 2000, 2000};
-/* PS measurement repeat rate in ms */
-static int ps_mrr_table[] = { 50, 70, 100, 200, 500, 1000, 2000, 10,
-				10, 10, 10, 10, 10, 10, 10, 10};
-
-/* Tuned for devices with rubber */
-static int ps_distance_table[] =  { 790, 337, 195, 114, 78, 62, 50 };
-
-static int sensitivity_table[] = {150, 150, 100, 100, 0, 0, 100, 1};
-
-static struct sensors_classdev als_cdev = {
-	.name = "ltr553-light",
-	.vendor = "Lite-On Technology Corp",
+static struct sensors_classdev sensors_light_cdev = {
+	.name = "liteon-light",
+	.vendor = "liteon",
 	.version = 1,
 	.handle = SENSORS_LIGHT_HANDLE,
 	.type = SENSOR_TYPE_LIGHT,
-	.max_range = "65536",
-	.resolution = "1.0",
-	.sensor_power = "0.25",
-	.min_delay = 50000,
-	.max_delay = 2000,
+	.max_range = "60000",
+	.resolution = "0.0125",
+	.sensor_power = "0.20",
+	.min_delay = 0, /* in microseconds */
 	.fifo_reserved_event_count = 0,
 	.fifo_max_event_count = 0,
-	.flags = 2,
 	.enabled = 0,
-	.delay_msec = 50,
+	.flags = 2,
+	.delay_msec = 100,
 	.sensors_enable = NULL,
 	.sensors_poll_delay = NULL,
 };
 
-static struct sensors_classdev ps_cdev = {
-	.name = "ltr553-proximity",
-	.vendor = "Lite-On Technology Corp",
+static struct sensors_classdev sensors_proximity_cdev = {
+	.name = "liteon-proximity",
+	.vendor = "liteon",
 	.version = 1,
 	.handle = SENSORS_PROXIMITY_HANDLE,
 	.type = SENSOR_TYPE_PROXIMITY,
-	.max_range = "7",
-	.resolution = "1.0",
-	.sensor_power = "0.25",
-	.min_delay = 10000,
-	.max_delay = 2000,
+	.max_range = "5",
+	.resolution = "5.0",
+	.sensor_power = "3",
+	.min_delay = 0, /* in microseconds */
 	.fifo_reserved_event_count = 0,
 	.fifo_max_event_count = 0,
-	.flags = 3,
 	.enabled = 0,
-	.delay_msec = 50,
+	.flags = 3,
+	.delay_msec = 100,
 	.sensors_enable = NULL,
 	.sensors_poll_delay = NULL,
 };
 
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
+#define LTR_I2C_RETRY_COUNT 3
+
+#ifdef CONFIG_PSENSOR_ONDEMAND_STATE
 static struct sensors_classdev *proximity_sensor_dev = NULL;
 #endif
 
-static int sensor_power_init(struct device *dev, struct regulator_map *map,
-		int size)
+static s32 ltr559_sensor_I2C_Wrtie(const struct i2c_client *client, u8 command, u8 value)
 {
-	int rc;
-	int i;
+	int ret = 0;
+	int retry;
 
-	for (i = 0; i < size; i++) {
-		map[i].regulator = devm_regulator_get(dev, map[i].supply);
-		if (IS_ERR(map[i].regulator)) {
-			rc = PTR_ERR(map[i].regulator);
-			dev_err(dev, "Regualtor get failed vdd rc=%d\n", rc);
-			goto exit;
-		}
-		if (regulator_count_voltages(map[i].regulator) > 0) {
-			rc = regulator_set_voltage(map[i].regulator,
-					map[i].min_uv, map[i].max_uv);
-			if (rc) {
-				dev_err(dev, "Regulator set failed vdd rc=%d\n",
-						rc);
-				goto exit;
-			}
-		}
-	}
+	for (retry = 0; retry < LTR_I2C_RETRY_COUNT; retry++) {
+		ret = i2c_smbus_write_byte_data(client, command, value);
 
-	return 0;
+		if (ret == 0)
+			break;
 
-exit:
-	/* Regulator not set correctly */
-	for (i = i - 1; i >= 0; i--) {
-		if (regulator_count_voltages(map[i].regulator))
-			regulator_set_voltage(map[i].regulator, 0,
-					map[i].max_uv);
-	}
+		pr_err("%s, i2c write error, ret = %d\r\n", __func__, ret);
+		mdelay(10);
+ 	}
 
-	return rc;
-}
-
-static int sensor_power_deinit(struct device *dev, struct regulator_map *map,
-		int size)
-{
-	int i;
-
-	for (i = 0; i < size; i++) {
-		if (!IS_ERR_OR_NULL(map[i].regulator)) {
-			if (regulator_count_voltages(map[i].regulator) > 0)
-				regulator_set_voltage(map[i].regulator, 0,
-						map[i].max_uv);
-		}
-	}
-
-	return 0;
-}
-
-static int sensor_power_config(struct device *dev, struct regulator_map *map,
-		int size, bool enable)
-{
-	int i;
-	int rc = 0;
-
-	if (enable) {
-		for (i = 0; i < size; i++) {
-			rc = regulator_enable(map[i].regulator);
-			if (rc) {
-				dev_err(dev, "enable %s failed.\n",
-						map[i].supply);
-				goto exit_enable;
-			}
-		}
-	} else {
-		for (i = 0; i < size; i++) {
-			rc = regulator_disable(map[i].regulator);
-			if (rc) {
-				dev_err(dev, "disable %s failed.\n",
-						map[i].supply);
-				goto exit_disable;
-			}
-		}
-	}
-
-	return 0;
-
-exit_enable:
-	for (i = i - 1; i >= 0; i--)
-		regulator_disable(map[i].regulator);
-
-	return rc;
-
-exit_disable:
-	for (i = i - 1; i >= 0; i--)
-		if (regulator_enable(map[i].regulator))
-			dev_err(dev, "enable %s failed\n", map[i].supply);
-
-	return rc;
-}
-
-static int sensor_pinctrl_init(struct device *dev,
-		struct pinctrl_config *config)
-{
-	config->pinctrl = devm_pinctrl_get(dev);
-	if (IS_ERR_OR_NULL(config->pinctrl)) {
-		dev_err(dev, "Failed to get pinctrl\n");
-		return PTR_ERR(config->pinctrl);
-	}
-
-	config->state[0] =
-		pinctrl_lookup_state(config->pinctrl, config->name[0]);
-	if (IS_ERR_OR_NULL(config->state[0])) {
-		dev_err(dev, "Failed to look up %s\n", config->name[0]);
-		return PTR_ERR(config->state[0]);
-	}
-
-	config->state[1] =
-		pinctrl_lookup_state(config->pinctrl, config->name[1]);
-	if (IS_ERR_OR_NULL(config->state[1])) {
-		dev_err(dev, "Failed to look up %s\n", config->name[1]);
-		return PTR_ERR(config->state[1]);
-	}
-
-	return 0;
-}
-
-static int ltr553_parse_dt(struct device *dev, struct ltr553_data *ltr)
-{
-	struct device_node *dp = dev->of_node;
-	u32 value;
-	int rc;
-	int i;
-
-	rc = of_get_named_gpio_flags(dp, "liteon,irq-gpio", 0,
-			&ltr->irq_flags);
-	if (rc < 0) {
-		dev_err(dev, "unable to read irq gpio\n");
-		return rc;
-	}
-	ltr->irq_gpio = rc;
-
-	/* als ps persist */
-	rc = of_property_read_u32(dp, "liteon,als-ps-persist", &value);
-	if (rc) {
-		dev_err(dev, "read liteon,als-ps-persist failed\n");
-		return rc;
-	}
-	ltr->als_ps_persist = value;
-
-	/* ps led */
-	rc = of_property_read_u32(dp, "liteon,ps-led", &value);
-	if (rc) {
-		dev_err(dev, "read liteon,ps-led failed\n");
-		return rc;
-	}
-	ltr->ps_led = value;
-
-	/* ps pulses */
-	rc = of_property_read_u32(dp, "liteon,ps-pulses", &value);
-	if (rc) {
-		dev_err(dev, "read liteon,ps-pulses failed\n");
-		return rc;
-	}
-	if (value > 0x7) {
-		dev_err(dev, "liteon,ps-pulses out of range\n");
+	if (retry >= LTR_I2C_RETRY_COUNT) {
+		pr_err("%s, i2c write retry over %d\n", __func__, LTR_I2C_RETRY_COUNT);
 		return -EINVAL;
-	}
-	ltr->ps_pulses = value;
+ 	}
 
-	/* als integration time */
-	rc = of_property_read_u32(dp, "liteon,als-integration-time", &value);
-	if (rc) {
-		dev_err(dev, "read liteon,als-integration-time failed\n");
-		return rc;
-	}
-	if (value > 0x7) {
-		dev_err(dev, "liteon,als-integration-time out of range\n");
-		return -EINVAL;
-	}
-	ltr->als_integration_time = value;
+	return ret;
+}
 
-	/* ps wakeup threshold */
-	rc = of_property_read_u32(dp, "liteon,wakeup-threshold", &value);
-	if (rc) {
-		dev_err(dev, "liteon,wakeup-threshold incorrect, drop to default\n");
-		value = LTR553_WAKEUP_ANY_CHANGE;
-	}
-	if ((value >= ARRAY_SIZE(ps_distance_table)) &&
-			(value != LTR553_WAKEUP_ANY_CHANGE)) {
-		dev_err(dev, "wakeup threshold too big\n");
+static s32 ltr559_sensor_I2C_Read(const struct i2c_client *client, u8 command)
+{
+	int ret = 0;
+	int retry;
+
+	for (retry = 0; retry < LTR_I2C_RETRY_COUNT; retry++) {
+		ret = i2c_smbus_read_byte_data(client, command);
+
+		if (ret >= 0)
+			break;
+
+		pr_err("%s, i2c read error, ret = %d\r\n", __func__, ret);
+		mdelay(10);
+ 	}
+
+	if (retry >= LTR_I2C_RETRY_COUNT) {
+		pr_err("%s, i2c read retry over %d\n", __func__, LTR_I2C_RETRY_COUNT);
 		return -EINVAL;
+ 	}
+
+	return ret;
+}
+
+
+#if defined(DYNAMIC_CALIBRATE)
+static int ltr559_ps_read(struct i2c_client *client)
+{
+	int psval_lo, psval_hi, psdata;
+	psval_lo = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_0);
+	if (psval_lo < 0) {
+			psdata = psval_lo;
+			goto out;
 	}
-	ltr->ps_wakeup_threshold = value;
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-	/* Prema Chand Alugu (premaca@gmail.com)
-	 *
-	 * FIXME: Have to check, if this change is effecting regular in-call
-	 * proximity, will reveret if there is an issue
-	 *
-	 * Modify the wakeup threshold to little lower so that the detection
-	 * would be faster
-	 */
-	if (ltr->ps_wakeup_threshold > 2) {
-		ltr->ps_wakeup_threshold = 2;
+	psval_hi = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_1);
+	if (psval_hi < 0) {
+			psdata = psval_hi;
+			goto out;
 	}
+
+	psdata = ((psval_hi & 7) * 256) + psval_lo;
+
+
+
+out:
+	return psdata;
+}
 #endif
 
-	/* ps distance table */
-	rc = of_property_read_u32_array(dp, "liteon,ps-distance-table",
-			ps_distance_table, ARRAY_SIZE(ps_distance_table));
-	if ((rc == -ENODATA) || (rc == -EOVERFLOW)) {
-		dev_warn(dev, "liteon,ps-distance-table not correctly set\n");
-		return rc;
-	}
+static int ltr559_chip_reset(struct i2c_client *client)
+{
+	int ret;
 
-	for (i = 1; i < ARRAY_SIZE(ps_distance_table); i++) {
-		if (ps_distance_table[i - 1] < ps_distance_table[i]) {
-			dev_err(dev, "ps distance table should in descend order\n");
-			return -EINVAL;
+	ret = ltr559_sensor_I2C_Wrtie(client, LTR559_ALS_CONTR, MODE_ALS_StdBy);
+	ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, MODE_PS_StdBy);
+	ret = ltr559_sensor_I2C_Wrtie(client, LTR559_ALS_CONTR, 0x02);
+	if (ret < 0)
+		printk("%s reset chip fail\n", __func__);
+
+	return ret;
+}
+
+static u32 ps_state_last = 0xff;
+
+
+static void ltr559_set_ps_threshold(struct i2c_client *client, u8 addr, u16 value)
+{
+	int ret = 0;
+
+	ret = ltr559_sensor_I2C_Wrtie(client, addr, (value & 0xff));
+	if (ret < 0) {
+		pr_err("%s: i2c write fail L, value =(%d) failed!\n", __func__, value);
+		return;
+	}
+	ret = ltr559_sensor_I2C_Wrtie(client, addr+1, (value >> 8));
+	if (ret < 0) {
+		pr_err("%s: i2c write fail H, value =(%d) failed!\n", __func__, value);
+		return;
+	}
+}
+
+static int ltr559_ps_enable(struct i2c_client *client, int on)
+{
+	struct ltr559_data *data = i2c_get_clientdata(client);
+	int ret = 0;
+	int contr_data;
+
+	if (on) {
+		#if defined(DYNAMIC_CALIBRATE)
+		if (0 != ltr559_ps_dynamic_caliberate_init(client, &data->ps_cdev)) {
+			pr_err("%s, dynamic calibrate fail!", __func__);
+			data->dynamic_noise = 800;
+			data->platform_data->prox_threshold = 1000;
+			data->platform_data->prox_hsyteresis_threshold = 900;
 		}
+		#endif
+		ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, reg_tbl[REG_PS_CONTR].curval);
+		msleep(WAKEUP_DELAY);
+
+		if (ret < 0) {
+			pr_err("%s: enable=(%d) failed!\n", __func__, on);
+			return ret;
+		}
+		contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+		if (contr_data != reg_tbl[REG_PS_CONTR].curval) {
+
+			pr_err("%s: enable=(%d) failed!\n", __func__, on);
+			return -EFAULT;
+		}
+
+		data->ps_state = 0xff;
+		ps_state_last = 0xff;
+
+		#if defined(DYNAMIC_CALIBRATE)
+		ltr559_set_ps_threshold(data->client, LTR559_PS_THRES_LOW_0, data->platform_data->prox_hsyteresis_threshold);
+		ltr559_set_ps_threshold(data->client, LTR559_PS_THRES_UP_0, data->platform_data->prox_threshold);
+		#else
+		ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, data->platform_data->prox_threshold);
+		ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, data->platform_data->prox_threshold-1);
+		#endif
+
+		wake_lock(&data->ps_wakelock);
+
+
+	} else {
+
+		wake_unlock(&data->ps_wakelock);
+
+		ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, 0);
+		ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, 0x7ff);
+
+
+		ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, MODE_PS_StdBy);
+		if (ret < 0) {
+			pr_err("%s: enable=(%d) failed!\n", __func__, on);
+			return ret;
+		}
+
+		contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+		if (contr_data != reg_tbl[REG_PS_CONTR].defval) {
+			pr_err("%s:  enable=(%d) failed!\n", __func__, on);
+			return -EFAULT;
+		}
+
+		data->ps_state = 0xff;
+		input_report_abs(data->input_dev_ps, ABS_DISTANCE, data->ps_state);
+		input_sync(data->input_dev_ps);
+
 	}
-
-	if (ps_distance_table[0] > PS_DATA_MASK) {
-		dev_err(dev, "distance table out of range\n");
-		return -EINVAL;
-	}
-
-	/* als gain */
-	rc = of_property_read_u32(dp, "liteon,als-gain", &value);
-	if (rc) {
-		dev_err(dev, "read liteon,als-gain failed. Drop to default\n");
-		value = 0;
-	}
-	/* 4 & 5 are reserved */
-	if ((value > 0x7) || (value == 0x4) || (value == 0x5)) {
-		dev_err(dev, "liteon,als-gain invalid\n");
-		return -EINVAL;
-	}
-	ltr->als_gain = value;
-
-	/* als sensitivity */
-	rc = of_property_read_u32_array(dp, "liteon,als-sensitivity",
-			sensitivity_table, ARRAY_SIZE(sensitivity_table));
-	if (rc)
-		dev_info(dev, "read liteon,als-sensitivity failed. Drop to default\n");
-
-	/* als equation map */
-	rc = of_property_read_u32_array(dp, "liteon,als-equation-0",
-			&eqtn_map[0].ch0_coeff_i, 6);
-	if (rc)
-		dev_warn(dev, "read liteon,als-equation-0 failed. Drop to default\n");
-
-	rc = of_property_read_u32_array(dp, "liteon,als-equation-0",
-			&eqtn_map[1].ch0_coeff_i, 6);
-	if (rc)
-		dev_warn(dev, "read liteon,als-equation-1 failed. Drop to default\n");
-
-	rc = of_property_read_u32_array(dp, "liteon,als-equation-0",
-			&eqtn_map[2].ch0_coeff_i, 6);
-	if (rc)
-		dev_warn(dev, "read liteon,als-equation-2 failed. Drop to default\n");
-
-	rc = of_property_read_u32_array(dp, "liteon,als-equation-3",
-			&eqtn_map[3].ch0_coeff_i, 6);
-	if (rc)
-		dev_warn(dev, "read liteon,als-equation-3 failed. Drop to default\n");
-
-	return 0;
+	pr_err("%s: enable=(%d) OK\n", __func__, on);
+	return ret;
 }
 
-static int ltr553_check_device(struct ltr553_data *ltr)
+/*
+ * Absent Light Sensor Congfig
+ */
+static int ltr559_als_enable(struct i2c_client *client, int on)
 {
-	unsigned int part_id;
-	int rc;
+	struct ltr559_data *data = i2c_get_clientdata(client);
+	int ret;
 
-	rc = regmap_read(ltr->regmap, LTR553_REG_PART_ID, &part_id);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read reg %d failed.(%d)\n",
-				LTR553_REG_PART_ID, rc);
-		return rc;
+	if (on) {
+		ret = ltr559_sensor_I2C_Wrtie(client, LTR559_ALS_CONTR, reg_tbl[REG_ALS_CONTR].curval);
+		msleep(WAKEUP_DELAY);
+		ret |= ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH0_1);
+
+
+		schedule_delayed_work(&data->als_work, msecs_to_jiffies(data->platform_data->als_poll_interval));
+
+	} else {
+		cancel_delayed_work_sync(&data->als_work);
+		ret = ltr559_sensor_I2C_Wrtie(client, LTR559_ALS_CONTR, MODE_ALS_StdBy);
 	}
-
-	if (part_id != LTR553_PART_ID)
-		return -ENODEV;
-
-	return 0;
+	pr_err("%s: enable=(%d) ret=%d\n", __func__, on, ret);
+	return ret;
 }
 
-static int ltr553_init_input(struct ltr553_data *ltr)
+static int ltr559_als_read(struct i2c_client *client)
 {
-	struct input_dev *input;
-	int status;
+	int alsval_ch0_lo, alsval_ch0_hi, alsval_ch0;
+	int alsval_ch1_lo, alsval_ch1_hi, alsval_ch1;
+	int luxdata;
+	int ch1_co, ch0_co, ratio;
 
-	input = devm_input_allocate_device(&ltr->i2c->dev);
-	if (!input) {
-		dev_err(&ltr->i2c->dev, "allocate light input device failed\n");
-		return -ENOMEM;
+	alsval_ch1_lo = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH1_0);
+	alsval_ch1_hi = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH1_1);
+	if (alsval_ch1_lo < 0 || alsval_ch1_hi < 0)
+		return -EPERM;
+	alsval_ch1 = (alsval_ch1_hi << 8) + alsval_ch1_lo;
+
+	alsval_ch0_lo = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH0_0);
+	alsval_ch0_hi = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH0_1);
+	if (alsval_ch0_lo < 0 || alsval_ch0_hi < 0)
+		return -EPERM;
+	alsval_ch0 = (alsval_ch0_hi << 8) + alsval_ch0_lo;
+
+
+	if ((alsval_ch0 + alsval_ch1) == 0) {
+		pr_err("%s, (alsval_ch0 + alsval_ch1) == 0, retry", __func__);
+		msleep(40);
+		alsval_ch1_lo = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH1_0);
+		alsval_ch1_hi = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH1_1);
+		if (alsval_ch1_lo < 0 || alsval_ch1_hi < 0)
+			return -EPERM;
+		alsval_ch1 = (alsval_ch1_hi << 8) + alsval_ch1_lo;
+
+		alsval_ch0_lo = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH0_0);
+		alsval_ch0_hi = ltr559_sensor_I2C_Read(client, LTR559_ALS_DATA_CH0_1);
+		if (alsval_ch0_lo < 0 || alsval_ch0_hi < 0)
+			return -EPERM;
+		alsval_ch0 = (alsval_ch0_hi << 8) + alsval_ch0_lo;
+
+		if ((alsval_ch0 + alsval_ch1) == 0)
+			ratio = 1000;
+	} else {
+		ratio = alsval_ch1 * 1000 / (alsval_ch1 + alsval_ch0);
 	}
 
-	input->name = LTR553_LIGHT_INPUT_NAME;
-	input->phys = "ltr553/input0";
-	input->id.bustype = BUS_I2C;
-
-	input_set_capability(input, EV_ABS, ABS_MISC);
-	input_set_abs_params(input, ABS_MISC, 0, LTR553_MAX_LUX, 0, 0);
-
-	status = input_register_device(input);
-	if (status) {
-		dev_err(&ltr->i2c->dev, "register light input device failed.\n");
-		return status;
+	if (ratio < 450) {
+		ch0_co = 17743;
+		ch1_co = -11059;
+	} else if ((ratio >= 450) && (ratio < 640)) {
+		ch0_co = 42785;
+		ch1_co = 19548;
+	} else if ((ratio >= 640) && (ratio < 850)) {
+		ch0_co = 5926;
+		ch1_co = -1185;
+	} else if (ratio >= 850) {
+		ch0_co = 0;
+		ch1_co = 0;
 	}
-
-	ltr->input_light = input;
-
-	input = devm_input_allocate_device(&ltr->i2c->dev);
-	if (!input) {
-		dev_err(&ltr->i2c->dev, "allocate proximity input device failed\n");
-		return -ENOMEM;
-	}
-
-	input->name = LTR553_PROXIMITY_INPUT_NAME;
-	input->phys = "ltr553/input1";
-	input->id.bustype = BUS_I2C;
-
-	input_set_capability(input, EV_ABS, ABS_DISTANCE);
-	input_set_abs_params(input, ABS_DISTANCE, 0,
-			ARRAY_SIZE(ps_distance_table), 0, 0);
-
-	status = input_register_device(input);
-	if (status) {
-		dev_err(&ltr->i2c->dev, "register proxmity input device failed.\n");
-		return status;
-	}
-
-	ltr->input_proximity = input;
-
-	return 0;
+	luxdata = (alsval_ch0 * ch0_co - alsval_ch1 * ch1_co) / 10000;
+		return luxdata;
 }
 
-static int ltr553_init_device(struct ltr553_data *ltr)
+static void ltr559_ps_work_func(struct work_struct *work)
 {
-	int rc;
-	unsigned int tmp;
+	struct ltr559_data *data = container_of(work, struct ltr559_data, ps_work.work);
+	struct i2c_client *client = data->client;
+	int als_ps_status;
+	int psval_lo, psval_hi, psdata;
+	int i = 0;
 
-	/* Enable als/ps interrupt */
-	rc = regmap_write(ltr->regmap, LTR553_REG_INTERRUPT,
-			LTR553_INTERRUPT_SETTING);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_INTERRUPT);
-		return rc;
-	}
+#ifdef DEBUG
+	static int cnt;
+#endif
+	mutex_lock(&data->op_lock);
 
-	rc = regmap_write(ltr->regmap, LTR553_REG_INTERRUPT_PERSIST,
-			ltr->als_ps_persist);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_INTERRUPT_PERSIST);
-		return rc;
-	}
+#ifdef DEBUG
+	wing_info("ltr559_ps_work_func cnt = %d.\n", cnt++);
+#endif
 
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_N_PULSES, ltr->ps_pulses);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_PS_N_PULSES);
-		return rc;
-	}
-
-	rc = regmap_write(ltr->regmap, LTR553_REG_ALS_MEAS_RATE,
-		(ltr->als_integration_time << 3) | (ltr->als_measure_rate));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed\n",
-				LTR553_REG_ALS_MEAS_RATE);
-		return rc;
-	}
-
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_MEAS_RATE,
-			ltr->ps_measure_rate);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed\n",
-				LTR553_REG_PS_MEAS_RATE);
-		return rc;
-	}
-
-	/* Set calibration parameter low byte */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_OFFSET_0,
-			PS_LOW_BYTE(ltr->bias));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_PS_OFFSET_0);
-		return rc;
-	}
-
-	/* Set calibration parameter high byte */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_OFFSET_1,
-			PS_HIGH_BYTE(ltr->bias));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_PS_OFFSET_1);
-		return rc;
-	}
-
-	/* set up als gain */
-	rc = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL, &tmp);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d register failed\n",
-				LTR553_REG_ALS_CTL);
-		return rc;
-	}
-	rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-			(tmp & (~0x1c)) | (ltr->als_gain << 2));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d register failed\n",
-				LTR553_REG_ALS_CTL);
-		return rc;
-	}
-
-	return 0;
-}
-
-/* Calculate the lux value based on ADC data */
-static int ltr553_calc_lux(int ch0data, int ch1data, int gain, int als_int_fac)
-{
-	int ratio;
-	int lux_i;
-	int lux_f;
-	int lux;
-	struct als_coeff *eqtn;
-
-	/* avoid divided by 0 */
-	if ((ch0data == 0) && (ch1data == 0))
-		return 0;
-
-	ratio = ch1data * 100 / (ch0data + ch1data);
-	if (ratio < 45)
-		eqtn = &eqtn_map[0];
-	else if ((ratio >= 45) && (ratio < 68))
-		eqtn = &eqtn_map[1];
-	else if ((ratio >= 68) && (ratio < 99))
-		eqtn = &eqtn_map[2];
-	else
-		eqtn = &eqtn_map[3];
-
-	lux_i = (ch0data * eqtn->ch0_coeff_i + ch1data * eqtn->ch1_coeff_i *
-			eqtn->sign) * eqtn->win_fac;
-	lux_f = (ch0data * eqtn->ch0_coeff_f + ch1data * eqtn->ch1_coeff_f *
-			eqtn->sign) / 100 * eqtn->win_fac;
-
-	lux = (lux_i + abs(lux_f) / 100) / (gain * als_int_fac);
-
-	return lux;
-}
-
-/* Calculate adc value based on lux. Return value is positive */
-static int ltr553_calc_adc(int ratio, int lux, int gain, int als_int_fac)
-{
-	int divisor_i;
-	int divisor_f;
-	int dividend;
-	struct als_coeff *eqtn;
-	int result;
-
-	/* avoid devided by 0 */
-	if (ratio == 0)
-		return 0;
-
-	if (ratio < 45)
-		eqtn = &eqtn_map[0];
-	else if ((ratio >= 45) && (ratio < 68))
-		eqtn = &eqtn_map[1];
-	else if ((ratio >= 68) && (ratio < 99))
-		eqtn = &eqtn_map[2];
-	else
-		eqtn = &eqtn_map[3];
-
-	dividend = lux * gain * als_int_fac;
-	divisor_i = ((100 - ratio) * eqtn->ch0_coeff_i / ratio +
-			eqtn->ch1_coeff_i * eqtn->sign) * eqtn->win_fac;
-	divisor_f = abs((100 - ratio) * eqtn->ch0_coeff_f / ratio +
-			eqtn->ch1_coeff_f * eqtn->sign) * eqtn->win_fac / 10000;
-
-	/* avoid divided by 0 */
-	if ((divisor_i + divisor_f) == 0)
-		return 0;
-
-	result = dividend / (divisor_i + divisor_f);
-
-	return result <= 0 ? 1 : result;
-}
-
-/* update als gain and threshold */
-static int ltr553_als_update_setting(struct ltr553_data *ltr,
-		int ch0data, int ch1data, int als_int_fac)
-{
-	int gain_index;
-	unsigned int config;
-	unsigned int ratio;
-	unsigned int adc_base;
-	int rc;
-	int adc;
-	int i;
-	u8 als_data[4];
-
-	for (i = ARRAY_SIZE(als_gain_table) - 1; i >= 0; i--) {
-		if ((i == 4) || (i == 5))
-			continue;
-
-		if ((ch0data + ch1data) * als_gain_table[i] /
-				als_gain_table[ltr->als_gain] <
-				ALS_GAIN_SWITCH_THRESHOLD)
-			break;
-	}
-
-	gain_index = i < 0 ? 0 : i;
-
-	/*
-	 * Disable als and enable it again to avoid incorrect value.
-	 * Updating als gain during als measurement cycle will cause
-	 * incorrect light sensor adc value. The logic here is to handle
-	 * this scenario.
+	als_ps_status = ltr559_sensor_I2C_Read(client, LTR559_ALS_PS_STATUS);
+	printk("%s ps_open_state=%d, als_ps_status=0x%x\n", __func__, data->ps_open_state, als_ps_status);
+	if (als_ps_status < 0)
+		goto workout;
+	/* Here should check data status, ignore interrupt status. */
+	/* Bit 0: PS Data
+	 * Bit 1: PS interrupt
+	 * Bit 2: ASL Data
+	 * Bit 3: ASL interrupt
+	 * Bit 4: ASL Gain 0: ALS measurement data is in dynamic range 2 (2 to 64k lux)
+	 * 1: ALS measurement data is in dynamic range 1 (0.01 to 320 lux)
 	 */
 
-	if (ltr->als_gain != gain_index) {
-		rc = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL, &config);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_ALS_CTL, rc);
-			return rc;
-		}
+	if ((data->ps_open_state == 1) && (als_ps_status & 0x03)) {
 
-		/* disable als sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-				config & (~0x1));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_ALS_CTL, rc);
-			return rc;
-		}
-
-		/* write new als gain */
-		rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-				(config & (~0x1c)) | (gain_index << 2));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d register failed\n",
-					LTR553_REG_ALS_CTL);
-			return rc;
-		}
-	}
-
-	if ((ch0data == 0) && (ch1data == 0)) {
-		adc = 1;
-	} else {
-		ratio = ch1data * 100 / (ch0data + ch1data);
-		dev_dbg(&ltr->i2c->dev, "ratio:%d\n", ratio);
-		adc = ltr553_calc_adc(ratio, sensitivity_table[gain_index],
-				als_gain_table[gain_index], als_int_fac);
-	}
-
-	dev_dbg(&ltr->i2c->dev, "adc:%d\n", adc);
-
-	/* catch'ya! */
-	adc_base = ch0data * als_gain_table[gain_index] /
-		als_gain_table[ltr->als_gain];
-
-	/* upper threshold */
-	if (adc_base + adc > ALS_DATA_MASK) {
-		als_data[0] = 0xff;
-		als_data[1] = 0xff;
-	} else {
-		als_data[0] = ALS_LOW_BYTE(adc_base + adc);
-		als_data[1] = ALS_HIGH_BYTE(adc_base + adc);
-	}
-
-	/* lower threshold */
-	if (adc_base < adc) {
-		als_data[2] = 0x0;
-		als_data[3] = 0x0;
-	} else {
-		als_data[2] = ALS_LOW_BYTE(adc_base - adc);
-		als_data[3] = ALS_HIGH_BYTE(adc_base - adc);
-	}
-
-	rc = regmap_bulk_write(ltr->regmap, LTR553_REG_ALS_THRES_UP_0,
-			als_data, 4);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_ALS_THRES_UP_0, rc);
-		return rc;
-	}
-
-	if (ltr->als_gain != gain_index) {
-		/* enable als_sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-				(config & (~0x1c)) | (gain_index << 2) | 0x1);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_ALS_CTL, rc);
-			return rc;
-		}
-
-		ltr->als_gain = gain_index;
-	}
-
-	return 0;
-}
-
-static int ltr553_process_data(struct ltr553_data *ltr, int als_ps)
-{
-	int als_int_fac;
-	ktime_t	timestamp;
-	int rc = 0;
-
-	unsigned int tmp;
-	u8 als_data[4];
-	int lux;
-	int ch0data;
-	int ch1data;
-
-	u8 ps_data[4];
-	int i;
-	int distance;
-
-	timestamp = ktime_get_boottime();
-
-	if (als_ps) { /* process als data */
-		/* Read data */
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_ALS_DATA_CH1_0,
-				als_data, 4);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_ALS_DATA_CH1_0, rc);
-			goto exit;
-		}
-		ch0data = als_data[2] | (als_data[3] << 8);
-		ch1data = als_data[0] | (als_data[1] << 8);
-
-		rc = regmap_read(ltr->regmap, LTR553_REG_ALS_MEAS_RATE, &tmp);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_ALS_MEAS_RATE, rc);
-			goto exit;
-		}
-
-		tmp = (tmp & LTR553_ALS_MEASURE_MASK) >> 3;
-		als_int_fac = als_int_fac_table[tmp];
-		lux = ltr553_calc_lux(ch0data, ch1data,
-				als_gain_table[ltr->als_gain], als_int_fac);
-
-		dev_dbg(&ltr->i2c->dev, "lux:%d als_data:0x%x-0x%x-0x%x-0x%x\n",
-				lux, als_data[0], als_data[1],
-				als_data[2], als_data[3]);
-
-		rc = regmap_read(ltr->regmap, LTR553_REG_ALS_PS_STATUS, &tmp);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_ALS_PS_STATUS, rc);
-			goto exit;
-		}
-
-
-		if ((lux != ltr->last_als) && (!LTR553_ALS_INVALID(tmp))) {
-			input_report_abs(ltr->input_light, ABS_MISC, lux);
-			input_event(ltr->input_light, EV_SYN, SYN_TIME_SEC,
-					ktime_to_timespec(timestamp).tv_sec);
-			input_event(ltr->input_light, EV_SYN, SYN_TIME_NSEC,
-					ktime_to_timespec(timestamp).tv_nsec);
-			input_sync(ltr->input_light);
-
-			ltr->last_als_ts = timestamp;
-		}
-
-		ltr->last_als = lux;
-
-		dev_dbg(&ltr->i2c->dev, "previous als_gain:%d\n",
-				ltr->als_gain);
-
-		rc = ltr553_als_update_setting(ltr, ch0data, ch1data,
-				als_int_fac);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "update setting failed\n");
-			goto exit;
-		}
-
-		dev_dbg(&ltr->i2c->dev, "new als_gain:%d\n",
-				ltr->als_gain);
-
-
-	} else { /* process ps value */
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_PS_DATA_0,
-				ps_data, 2);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_PS_DATA_0, rc);
-			goto exit;
-		}
-
-		dev_dbg(&ltr->i2c->dev, "ps data: 0x%x 0x%x\n",
-				ps_data[0], ps_data[1]);
-
-		tmp = (ps_data[1] << 8) | ps_data[0];
-		if (tmp & LTR553_PS_SATURATE_MASK)
-			distance = 0;
-		else {
-			for (i = 0; i < ARRAY_SIZE(ps_distance_table); i++) {
-				if (tmp > ps_distance_table[i]) {
-					distance = i;
-					break;
-				}
+		for (i = 0; i < 5; i++) {
+			psval_lo = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_0);
+			if (psval_lo < 0) {
+				psdata = psval_lo;
+				goto workout;
 			}
-			distance = i;
+			psval_hi = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_1);
+			if (psval_hi < 0) {
+				psdata = psval_hi;
+				goto workout;
+			}
+			psdata = ((psval_hi & 7) << 8) | psval_lo;
+
+			if (psdata <= 0) {
+				pr_err("%s, ltr559 read data error, psdata = %d!\n", __func__, psdata);
+				msleep(10);
+			} else if (psdata < 10) {
+				msleep(10);
+				psval_lo = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_0);
+				if (psval_lo < 0) {
+					psdata = psval_lo;
+					goto workout;
+				}
+				psval_hi = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_1);
+				if (psval_hi < 0) {
+					psdata = psval_hi;
+					goto workout;
+				}
+				psdata = ((psval_hi & 7) << 8) | psval_lo;
+				if (psdata > 0)
+					break;
+			} else {
+				break;
+			}
 		}
 
-		if (distance != ltr->last_ps) {
-			input_report_abs(ltr->input_proximity, ABS_DISTANCE,
-					distance);
-			input_event(ltr->input_proximity, EV_SYN, SYN_TIME_SEC,
-					ktime_to_timespec(timestamp).tv_sec);
-			input_event(ltr->input_proximity, EV_SYN, SYN_TIME_NSEC,
-					ktime_to_timespec(timestamp).tv_nsec);
-			input_sync(ltr->input_proximity);
+		printk("%s ps data =%d(0x%x), psval_hi=0x%x, psval_lo=0x%x, data->dynamic_noise = %d\n", __func__, psdata, psdata, psval_hi, psval_lo, data->dynamic_noise);
+		if (psdata >= data->platform_data->prox_threshold) {
+			data->ps_state = 0;
+			ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, data->platform_data->prox_hsyteresis_threshold);
+			ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, 0x07ff);
+		} else if (psdata <= data->platform_data->prox_hsyteresis_threshold) {
+			data->ps_state = 1;
 
-			ltr->last_ps_ts = timestamp;
+#if defined(DYNAMIC_CALIBRATE)
+			if ((data->dynamic_noise >= 10 && (((int)data->dynamic_noise - psdata > 30) ||
+					(psdata - (int)data->dynamic_noise > 15))) ||
+					(ps_state_last == 0xff && (psdata - (int)data->dynamic_noise) < 200)) {
+
+				data->dynamic_noise = psdata;
+
+				if (psdata < 10) {
+					data->dynamic_noise = 800;
+					data->platform_data->prox_threshold = 1000;
+					data->platform_data->prox_hsyteresis_threshold = 900;
+				} else if (psdata < 50) {
+					data->platform_data->prox_threshold = psdata+25;
+					data->platform_data->prox_hsyteresis_threshold = psdata+20;
+				} else if (psdata < 100) {
+					data->platform_data->prox_threshold = psdata+40;
+					data->platform_data->prox_hsyteresis_threshold = psdata+25;
+				} else if (psdata < 200) {
+					data->platform_data->prox_threshold = psdata+70;
+					data->platform_data->prox_hsyteresis_threshold = psdata+40;
+				} else if (psdata < 400) {
+					data->platform_data->prox_threshold = psdata+100;
+					data->platform_data->prox_hsyteresis_threshold = psdata+50;
+				} else if (psdata < 800) {
+					  data->platform_data->prox_threshold = psdata+200;
+					  data->platform_data->prox_hsyteresis_threshold = psdata+100;
+				 } else {
+					  data->platform_data->prox_threshold = 1000;
+					  data->platform_data->prox_hsyteresis_threshold = 900;
+
+					  pr_err("ltr559 the proximity sensor rubber or structure is error!\n");
+				 }
+
+				}
+#endif
+
+			ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, 0);
+			ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, data->platform_data->prox_threshold);
+		} else {
+			data->ps_state = ps_state_last;
 		}
 
-		ltr->last_ps = distance;
+		if (ps_state_last != data->ps_state) {
+			printk("%s, %d, %d\n", __func__, data->platform_data->prox_threshold, data->platform_data->prox_hsyteresis_threshold);
+			input_report_abs(data->input_dev_ps, ABS_DISTANCE, data->ps_state);
+			input_sync(data->input_dev_ps);
+			printk("%s, report ABS_DISTANCE=%s\n", __func__, data->ps_state ? "far" : "near");
 
-		/* lower threshold */
-		if (distance < ARRAY_SIZE(ps_distance_table))
-			tmp = ps_distance_table[distance];
-		else
-			tmp = 0;
-
-		ps_data[2] = PS_LOW_BYTE(tmp);
-		ps_data[3] = PS_HIGH_BYTE(tmp);
-
-		/* upper threshold */
-		if (distance > 0)
-			tmp = ps_distance_table[distance - 1];
-		else
-			tmp = PS_DATA_MASK;
-
-		ps_data[0] = PS_LOW_BYTE(tmp);
-		ps_data[1] = PS_HIGH_BYTE(tmp);
-
-		dev_dbg(&ltr->i2c->dev, "ps threshold: 0x%x 0x%x 0x%x 0x%x\n",
-				ps_data[0], ps_data[1], ps_data[2], ps_data[3]);
-
-		rc = regmap_bulk_write(ltr->regmap, LTR553_REG_PS_THRES_UP_0,
-				ps_data, 4);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_PS_THRES_UP_0, rc);
-			goto exit;
-		}
+			ps_state_last = data->ps_state;
+		} else
+			printk("%s, ps_state still %s\n", __func__, data->ps_state ? "far" : "near");
 	}
-exit:
-	return rc;
+workout:
+	enable_irq(data->irq);
+	mutex_unlock(&data->op_lock);
 }
 
-static irqreturn_t ltr553_irq_handler(int irq, void *data)
+static void ltr559_als_work_func(struct work_struct *work)
 {
-	struct ltr553_data *ltr = data;
-	bool rc;
+	struct ltr559_data *data = container_of(work, struct ltr559_data, als_work.work);
+	struct i2c_client *client = data->client;
+	int als_ps_status;
+	int als_data;
+	ktime_t	timestamp;
+#ifdef DEBUG
+	static int cnt;
+#endif
+	mutex_lock(&data->op_lock);
 
-	rc = queue_work(ltr->workqueue, &ltr->report_work);
-	/* wake up event should hold a wake lock until reported */
-	if (rc && (atomic_inc_return(&ltr->wake_count) == 1))
-		pm_stay_awake(&ltr->i2c->dev);
+#ifdef DEBUG
+	wing_info("ltr559_als_work_func cnt = %d.\n", cnt++);
+#endif
+	timestamp = ktime_get();
+	if (!data->als_open_state)
+		goto workout;
+
+	als_ps_status = ltr559_sensor_I2C_Read(client, LTR559_ALS_PS_STATUS);
+	if (als_ps_status < 0)
+		goto workout;
 
 
+	if ((data->als_open_state == 1) && (als_ps_status & 0x04)) {
+		als_data = ltr559_als_read(client);
+		if (als_data > 50000)
+			als_data = 50000;
+		if ((als_data >= 0) && (als_data != data->last_lux)) {
+			data->last_lux = als_data;
+			input_report_abs(data->input_dev_als, ABS_MISC, als_data);
+			input_event(data->input_dev_als, EV_SYN, SYN_TIME_SEC,
+					ktime_to_timespec(timestamp).tv_sec);
+			input_event(data->input_dev_als, EV_SYN, SYN_TIME_NSEC,
+					ktime_to_timespec(timestamp).tv_nsec);
+			input_sync(data->input_dev_als);
+		}
+	}
+
+	schedule_delayed_work(&data->als_work, msecs_to_jiffies(data->platform_data->als_poll_interval));
+workout:
+	mutex_unlock(&data->op_lock);
+}
+
+static irqreturn_t ltr559_irq_handler(int irq, void *arg)
+{
+	struct ltr559_data *data = (struct ltr559_data *)arg;
+
+#ifdef DEBUG
+	static int cnt;
+	wing_info("ltr559_irq_handler cnt = %d.\n", cnt++);
+#endif
+	if (NULL == data)
+		return IRQ_HANDLED;
+	disable_irq_nosync(data->irq);
+	schedule_delayed_work(&data->ps_work, 0);
 	return IRQ_HANDLED;
 }
 
-static void ltr553_report_work(struct work_struct *work)
+static int ltr559_gpio_irq(struct ltr559_data *data)
 {
-	struct ltr553_data *ltr = container_of(work, struct ltr553_data,
-			report_work);
-	int rc;
-	unsigned int status;
-	u8 buf[7];
-	int fake_interrupt = 0;
+		struct device_node *np = data->client->dev.of_node;
+	 int err = 0;
 
-	mutex_lock(&ltr->ops_lock);
+		data->platform_data->int_gpio = of_get_named_gpio_flags(np, "ltr,irq-gpio", 0, &data->platform_data->irq_gpio_flags);
+		if (data->platform_data->int_gpio < 0)
+			return -EIO;
 
-	/* avoid fake interrupt */
-	if (!ltr->power_enabled) {
-		dev_dbg(&ltr->i2c->dev, "fake interrupt triggered\n");
-		fake_interrupt = 1;
-		goto exit;
-	}
+		if (gpio_is_valid(data->platform_data->int_gpio)) {
+			err = gpio_request(data->platform_data->int_gpio, "ltr559_irq_gpio");
+			if (err) {
+				printk("%s irq gpio request failed\n", __func__);
+				return -EINTR;
+			}
 
-	/* read status */
-	rc = regmap_read(ltr->regmap, LTR553_REG_ALS_PS_STATUS, &status);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_ALS_PS_STATUS, rc);
-		status |= LTR553_PS_INT_MASK;
-		goto exit;
-	}
-
-	dev_dbg(&ltr->i2c->dev, "interrupt issued status=0x%x.\n", status);
-
-	/* als interrupt issueed */
-	if ((status & LTR553_ALS_INT_MASK) && (ltr->als_enabled)) {
-		rc = ltr553_process_data(ltr, 1);
-		if (rc)
-			goto exit;
-		dev_dbg(&ltr->i2c->dev, "process als done!\n");
-	}
-
-	if ((status & LTR553_PS_INT_MASK) && (ltr->ps_enabled)) {
-		rc = ltr553_process_data(ltr, 0);
-		if (rc)
-			goto exit;
-		dev_dbg(&ltr->i2c->dev, "process ps data done!\n");
-		pm_wakeup_event(&ltr->input_proximity->dev, 200);
-	}
-
-exit:
-	if (atomic_dec_and_test(&ltr->wake_count)) {
-		pm_relax(&ltr->i2c->dev);
-		dev_dbg(&ltr->i2c->dev, "wake lock released\n");
-	}
-
-	/* clear interrupt */
-	if (!fake_interrupt) {
-		if (regmap_bulk_read(ltr->regmap, LTR553_REG_ALS_DATA_CH1_0,
-					buf, ARRAY_SIZE(buf)))
-			dev_err(&ltr->i2c->dev, "clear interrupt failed\n");
-	}
-
-	mutex_unlock(&ltr->ops_lock);
-}
-
-static int ltr553_enable_ps(struct ltr553_data *ltr, int enable)
-{
-	unsigned int config;
-	unsigned int tmp;
-	int rc = 0;
-	u8 buf[7];
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_CTL, &config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		return rc;
-	}
-
-	if (enable) {
-		/* Enable ps sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL,
-				config | 0x02);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_PS_CTL, rc);
-			goto exit;
+			err = gpio_direction_input(data->platform_data->int_gpio);
+			if (err) {
+				printk("%s set_direction for irq gpio failed\n", __func__);
+				return -EIO;
+			}
 		}
 
-		rc = regmap_read(ltr->regmap, LTR553_REG_PS_MEAS_RATE, &tmp);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-					LTR553_REG_PS_MEAS_RATE, rc);
-			goto exit;
-		}
+		data->irq = data->client->irq = gpio_to_irq(data->platform_data->int_gpio);
 
-		/* Wait for data ready */
-		msleep(ps_mrr_table[tmp & 0xf] + LTR553_WAKE_TIME_MS);
+		if (request_irq(data->irq, ltr559_irq_handler, IRQ_TYPE_LEVEL_LOW,
+				LTR559_DRV_NAME, data)) {
+			printk("%s Could not allocate ltr559_INT !\n", __func__);
+			return -EINTR;
+	 	}
 
-		/* clear last ps value */
-		ltr->last_ps = -1;
+		irq_set_irq_wake(data->irq, 1);
 
-		rc = ltr553_process_data(ltr, 0);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "process ps data failed\n");
-			goto exit;
-		}
-
-		/* clear interrupt */
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_ALS_DATA_CH1_0,
-				buf, ARRAY_SIZE(buf));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "clear interrupt failed\n");
-			goto exit;
-		}
-
-		ltr->ps_enabled = true;
-		if (!ltr->als_enabled)
-			enable_irq(ltr->irq);
-
-	} else {
-		/* disable ps_sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL,
-				config & (~0x02));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_PS_CTL, rc);
-			goto exit;
-		}
-
-		ltr->ps_enabled = false;
-		if (!ltr->als_enabled)
-			disable_irq(ltr->irq);
-	}
-exit:
-	return rc;
-}
-
-static int ltr553_enable_als(struct ltr553_data *ltr, int enable)
-{
-	int rc = 0;
-	unsigned int config;
-	unsigned int tmp;
-	u8 buf[7];
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL, &config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_ALS_CTL, rc);
-		goto exit;
-	}
-
-	if (enable) {
-		/* enable als_sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-				config | 0x1);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_ALS_CTL, rc);
-			goto exit;
-		}
-
-		rc = regmap_read(ltr->regmap, LTR553_REG_ALS_MEAS_RATE, &tmp);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_ALS_MEAS_RATE, rc);
-			goto exit;
-		}
-
-		/* Wait for data ready */
-		msleep(als_mrr_table[tmp & 0x7] + LTR553_WAKE_TIME_MS);
-
-		/* Clear last value and report even not change. */
-		ltr->last_als = -1;
-
-		rc = ltr553_process_data(ltr, 1);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "process als data failed\n");
-			goto exit;
-		}
-
-		/* clear interrupt */
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_ALS_DATA_CH1_0,
-				buf, ARRAY_SIZE(buf));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "clear interrupt failed\n");
-			goto exit;
-		}
-
-		ltr->als_enabled = true;
-		if (!ltr->ps_enabled)
-			enable_irq(ltr->irq);
-	} else {
-		/* disable als sensor */
-		rc = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-				config & (~0x1));
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-					LTR553_REG_ALS_CTL, rc);
-			goto exit;
-		}
-
-		ltr->als_enabled = false;
-		if (!ltr->ps_enabled)
-			disable_irq(ltr->irq);
-	}
-
-exit:
-	return rc;
-}
-
-static int ltr553_als_sync_delay(struct ltr553_data *ltr,
-		unsigned int als_delay)
-{
-	int index = 0;
-	int i;
-	unsigned int val;
-	int rc = 0;
-	int min;
-
-	if (!ltr->power_enabled) {
-		dev_dbg(&ltr->i2c->dev, "power is not enabled\n");
+		printk(KERN_INFO "%s: INT No. %d", __func__, data->irq);
 		return 0;
-	}
-
-	min = abs(als_delay - als_mrr_table[0]);
-	for (i = 0; i < ARRAY_SIZE(als_mrr_table); i++) {
-		if (als_mrr_table[i] >= 10 *
-				als_int_fac_table[ltr->als_integration_time]) {
-			if (als_delay == als_mrr_table[i]) {
-				index = i;
-				break;
-			}
-			if (min > abs(als_delay - als_mrr_table[i])) {
-				index = i;
-				min = abs(als_delay - als_mrr_table[i]);
-			}
-		}
-	}
-
-	dev_dbg(&ltr->i2c->dev, "als delay %d ms\n", als_mrr_table[index]);
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_ALS_MEAS_RATE, &val);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed\n",
-				LTR553_REG_ALS_MEAS_RATE);
-		goto exit;
-	}
-	val &= ~0x7;
-
-	ltr->als_measure_rate = index;
-	rc = regmap_write(ltr->regmap, LTR553_REG_ALS_MEAS_RATE, val | index);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed\n",
-				LTR553_REG_ALS_MEAS_RATE);
-		goto exit;
-	}
-
-exit:
-	return rc;
 }
 
 
-static int ltr553_ps_sync_delay(struct ltr553_data *ltr, unsigned int ps_delay)
+static void ltr559_gpio_irq_free(struct ltr559_data *data)
 {
-	int index = 0;
-	int i;
-	int rc = 0;
-	int min;
-
-	if (!ltr->power_enabled) {
-		dev_dbg(&ltr->i2c->dev, "power is not enabled\n");
-		return 0;
-	}
-
-	min = abs(ps_delay - ps_mrr_table[0]);
-	for (i = 0; i < ARRAY_SIZE(ps_mrr_table); i++) {
-		if (ps_delay == ps_mrr_table[i]) {
-			index = i;
-			break;
-		}
-		if (min > abs(ps_delay - ps_mrr_table[i])) {
-			min = abs(ps_delay - ps_mrr_table[i]);
-			index = i;
-		}
-	}
-
-	ltr->ps_measure_rate = index;
-	dev_dbg(&ltr->i2c->dev, "ps delay %d ms\n", ps_mrr_table[index]);
-
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_MEAS_RATE, index);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed\n",
-				LTR553_REG_PS_MEAS_RATE);
-		goto exit;
-	}
-
-exit:
-	return rc;
+	free_irq(data->irq, data);
+	gpio_free(data->platform_data->int_gpio);
 }
 
-static void ltr553_als_enable_work(struct work_struct *work)
+static ssize_t ltr559_show_enable_ps(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct ltr553_data *ltr = container_of(work, struct ltr553_data,
-			als_enable_work);
+	struct ltr559_data *data = dev_get_drvdata(dev);
 
-	mutex_lock(&ltr->ops_lock);
-	if (!ltr->power_enabled) { /* new HAL? */
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-
-		msleep(LTR553_BOOT_TIME_MS);
-		ltr->power_enabled = true;
-		if (ltr553_init_device(ltr)) {
-			dev_err(&ltr->i2c->dev, "init device failed\n");
-			goto exit_power_off;
-		}
-
-		ltr553_als_sync_delay(ltr, ltr->als_delay);
-	}
-
-	if (ltr553_enable_als(ltr, 1)) {
-		dev_err(&ltr->i2c->dev, "enable als failed\n");
-		goto exit_power_off;
-	}
-
-exit_power_off:
-	if ((!ltr->als_enabled) && (!ltr->ps_enabled) &&
-			ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-		ltr->power_enabled = false;
-	}
-exit:
-	mutex_unlock(&ltr->ops_lock);
+	return sprintf(buf, "%u\n", data->ps_open_state);
 }
 
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-int ltr553_ps_ondemand_state (void)
+static ssize_t ltr559_store_enable_ps(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t size)
 {
-	struct ltr553_data *ltr = container_of(proximity_sensor_dev,
-			struct ltr553_data, ps_cdev);
-	unsigned int config;
-	unsigned int tmp;
-	u8 buf[7];
-	int rc = 0;
-	u8 ps_data[4];
-	int i;
-	int distance;
-	bool powered_on = false;
-	int proximity_state = LTR553_ON_DEMAND_RESET;
+	/* If proximity work, then ALS must be enable */
+	unsigned long val;
+	char *after;
+	struct ltr559_data *data = dev_get_drvdata(dev);
 
-	mutex_lock(&ltr->ops_lock);
-	if (!ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
+	val = simple_strtoul(buf, &after, 10);
 
-		msleep(LTR553_ONDEMAND_WAKE_TIME_MS);
-		powered_on = true;
+	printk(KERN_INFO "enable 559 PS sensor -> %ld\n", val);
 
-		if (ltr553_init_device(ltr)) {
-			dev_err(&ltr->i2c->dev, "init device failed\n");
-			goto exit;
-		}
-
-		ltr553_ps_sync_delay(ltr, ltr->ps_delay);
-	}
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_CTL, &config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit;
-	}
-
-	/* Enable ps sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL,
-			config | 0x02);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit;
-	}
-
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_MEAS_RATE, &tmp);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_MEAS_RATE, rc);
-		goto exit;
-	}
-
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_MEAS_RATE,
-			LTR553_PS_MEASUREMENT_RATE_10MS);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_MEAS_RATE, rc);
-		goto exit;
-	}
-
-	/* Wait for data ready */
-	msleep(LTR553_WAKE_TIME_MS);
-
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_MEAS_RATE, tmp);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_MEAS_RATE, rc);
-		goto exit;
-	}
-
-	rc = regmap_bulk_read(ltr->regmap, LTR553_REG_PS_DATA_0,
-			ps_data, 2);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_DATA_0, rc);
-		goto exit;
-	}
-
-	dev_dbg(&ltr->i2c->dev, "ps data: 0x%x 0x%x\n",
-			ps_data[0], ps_data[1]);
-
-	tmp = (ps_data[1] << 8) | ps_data[0];
-	if (tmp & LTR553_PS_SATURATE_MASK)
-		distance = 0;
-	else {
-		for (i = 0; i < ARRAY_SIZE(ps_distance_table); i++) {
-			if (tmp > ps_distance_table[i]) {
-				distance = i;
-				break;
-			}
-		}
-		distance = i;
-	}
-
-	proximity_state = (distance <= LTR553_ON_DEMAND_DISTANCE_THRESHOLD)
-	    ? LTR553_ON_DEMAND_COVERED 
-	    : LTR553_ON_DEMAND_UNCOVERED;
-
-	/* clear interrupt */
-	rc = regmap_bulk_read(ltr->regmap, LTR553_REG_ALS_DATA_CH1_0,
-			buf, ARRAY_SIZE(buf));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "clear interrupt failed\n");
-		goto exit;
-	}
-
-
-	/* disable ps_sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL,
-			config & (~0x02));
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit;
-	}
-
-exit:
-	if (powered_on) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-	}
-	mutex_unlock(&ltr->ops_lock);
-
-	return (proximity_state);
-}
-#endif /* CONFIG_PSENSOR_ONDEMAND_LTR553 */
-
-static void ltr553_als_disable_work(struct work_struct *work)
-{
-	struct ltr553_data *ltr = container_of(work, struct ltr553_data,
-			als_disable_work);
-
-	mutex_lock(&ltr->ops_lock);
-
-	if (ltr553_enable_als(ltr, 0)) {
-		dev_err(&ltr->i2c->dev, "disable als failed\n");
-		goto exit;
-	}
-
-	if ((!ltr->als_enabled) && (!ltr->ps_enabled) && ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-
-		ltr->power_enabled = false;
-	}
-
-exit:
-	mutex_unlock(&ltr->ops_lock);
-}
-
-static void ltr553_ps_enable_work(struct work_struct *work)
-{
-	struct ltr553_data *ltr = container_of(work, struct ltr553_data,
-			ps_enable_work);
-
-	mutex_lock(&ltr->ops_lock);
-	if (!ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-
-		msleep(LTR553_BOOT_TIME_MS);
-		ltr->power_enabled = true;
-
-		if (ltr553_init_device(ltr)) {
-			dev_err(&ltr->i2c->dev, "init device failed\n");
-			goto exit_power_off;
-		}
-
-		ltr553_ps_sync_delay(ltr, ltr->ps_delay);
-	}
-
-	if (ltr553_enable_ps(ltr, 1)) {
-		dev_err(&ltr->i2c->dev, "enable ps failed\n");
-		goto exit_power_off;
-	}
-
-exit_power_off:
-	if ((!ltr->als_enabled) && (!ltr->ps_enabled) &&
-			ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-		ltr->power_enabled = false;
-	}
-
-exit:
-	mutex_unlock(&ltr->ops_lock);
-}
-
-static void ltr553_ps_disable_work(struct work_struct *work)
-{
-	struct ltr553_data *ltr = container_of(work, struct ltr553_data,
-			ps_disable_work);
-
-	mutex_lock(&ltr->ops_lock);
-
-	if (ltr553_enable_ps(ltr, 0)) {
-		dev_err(&ltr->i2c->dev, "ltrsable ps failed\n");
-		goto exit;
-	}
-
-	if ((!ltr->als_enabled) && (!ltr->ps_enabled) && ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-
-		ltr->power_enabled = false;
-	}
-exit:
-	mutex_unlock(&ltr->ops_lock);
-}
-
-
-static struct regmap_config ltr553_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-};
-
-static int ltr553_cdev_enable_als(struct sensors_classdev *sensors_cdev,
-		unsigned int enable)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, als_cdev);
-
-	mutex_lock(&ltr->ops_lock);
-
-	if (enable)
-		queue_work(ltr->workqueue, &ltr->als_enable_work);
-	else
-		queue_work(ltr->workqueue, &ltr->als_disable_work);
-
-	mutex_unlock(&ltr->ops_lock);
-
-	return 0;
-}
-
-static int ltr553_cdev_enable_ps(struct sensors_classdev *sensors_cdev,
-		unsigned int enable)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-	mutex_lock(&ltr->ops_lock);
-
-	if (enable)
-		queue_work(ltr->workqueue, &ltr->ps_enable_work);
-	else
-		queue_work(ltr->workqueue, &ltr->ps_disable_work);
-
-	mutex_unlock(&ltr->ops_lock);
-
-	return 0;
-}
-
-static int ltr553_cdev_set_als_delay(struct sensors_classdev *sensors_cdev,
-		unsigned int delay_msec)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, als_cdev);
-	int rc;
-
-	mutex_lock(&ltr->ops_lock);
-
-	ltr->als_delay = delay_msec;
-	rc = ltr553_als_sync_delay(ltr, delay_msec);
-
-	mutex_unlock(&ltr->ops_lock);
-
-	return rc;
-}
-
-static int ltr553_cdev_set_ps_delay(struct sensors_classdev *sensors_cdev,
-		unsigned int delay_msec)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-	int rc;
-
-	mutex_lock(&ltr->ops_lock);
-
-	ltr->ps_delay = delay_msec;
-	rc = ltr553_ps_sync_delay(ltr, delay_msec);
-
-	mutex_unlock(&ltr->ops_lock);
-
-	return 0;
-}
-
-static int ltr553_cdev_ps_flush(struct sensors_classdev *sensors_cdev)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-	input_event(ltr->input_proximity, EV_SYN, SYN_CONFIG,
-			ltr->flush_count++);
-	input_sync(ltr->input_proximity);
-
-	return 0;
-}
-
-static int ltr553_cdev_als_flush(struct sensors_classdev *sensors_cdev)
-{
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, als_cdev);
-
-	input_event(ltr->input_light, EV_SYN, SYN_CONFIG, ltr->flush_count++);
-	input_sync(ltr->input_light);
-
-	return 0;
-}
-
-/* This function should be called when sensor is disabled */
-static int ltr553_cdev_ps_calibrate(struct sensors_classdev *sensors_cdev,
-		int axis, int apply_now)
-{
-	int rc;
-	int power;
-	unsigned int config;
-	unsigned int interrupt;
-	u16 min = PS_DATA_MASK;
-	u8 ps_data[2];
-	int count = LTR553_CALIBRATE_SAMPLES;
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-
-	if (axis != AXIS_BIAS)
-		return 0;
-
-	mutex_lock(&ltr->ops_lock);
-
-	/* Ensure only be called when sensors in standy mode */
-	if (ltr->als_enabled || ltr->ps_enabled) {
-		rc = -EPERM;
-		goto exit;
-	}
-
-	power = ltr->power_enabled;
-	if (!power) {
-		rc = sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-
-		msleep(LTR553_BOOT_TIME_MS);
-
-		rc = ltr553_init_device(ltr);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "init ltr553 failed\n");
-			goto exit;
-		}
-	}
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_INTERRUPT, &interrupt);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read interrupt configuration failed\n");
-		goto exit_power_off;
-	}
-
-	/* disable interrupt */
-	rc = regmap_write(ltr->regmap, LTR553_REG_INTERRUPT, 0x0);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "disable interrupt failed\n");
-		goto exit_power_off;
-	}
-
-	rc = regmap_read(ltr->regmap, LTR553_REG_PS_CTL, &config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* clear offset */
-	ps_data[0] = 0;
-	ps_data[1] = 0;
-	rc = regmap_bulk_write(ltr->regmap, LTR553_REG_PS_OFFSET_1,
-			ps_data, 2);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_OFFSET_1, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* enable ps sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL, config | 0x02);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	/* ps measurement rate set to fastest rate */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_MEAS_RATE,
-			LTR553_PS_MEASUREMENT_RATE_10MS);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-				LTR553_REG_PS_MEAS_RATE, rc);
-		goto exit_enable_interrupt;
-	}
-
-	msleep(LTR553_WAKE_TIME_MS);
-
-	while (--count) {
-		/* the measurement rate is 10 ms */
-		usleep_range(11000, 12000);
-		rc = regmap_bulk_read(ltr->regmap, LTR553_REG_PS_DATA_0,
-				ps_data, 2);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read PS data failed\n");
-			break;
-		}
-		if (min > ((ps_data[1] << 8) | ps_data[0]))
-			min = (ps_data[1] << 8) | ps_data[0];
-	}
-
-	/* disable ps sensor */
-	rc = regmap_write(ltr->regmap, LTR553_REG_PS_CTL, config);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_CTL, rc);
-		goto exit_enable_interrupt;
-	}
-
-	if (!count) {
-		if (min > (PS_DATA_MASK >> 1)) {
-			dev_err(&ltr->i2c->dev, "ps data out of range, check if shield\n");
-			rc = -EINVAL;
-			goto exit_enable_interrupt;
-		}
-
-		if (apply_now) {
-			ps_data[1] = PS_LOW_BYTE(min);
-			ps_data[0] = PS_HIGH_BYTE(min);
-			rc = regmap_bulk_write(ltr->regmap,
-					LTR553_REG_PS_OFFSET_1, ps_data, 2);
-			if (rc) {
-				dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-						LTR553_REG_PS_OFFSET_1, rc);
-				goto exit_enable_interrupt;
-			}
-			ltr->bias = min;
-		}
-
-		snprintf(ltr->calibrate_buf, sizeof(ltr->calibrate_buf),
-				"0,0,%d", min);
-		dev_dbg(&ltr->i2c->dev, "result: %s\n", ltr->calibrate_buf);
-	} else {
-		dev_err(&ltr->i2c->dev, "calibration failed\n");
-		rc = -EINVAL;
-	}
-
-exit_enable_interrupt:
-	if (regmap_write(ltr->regmap, LTR553_REG_INTERRUPT, interrupt)) {
-		dev_err(&ltr->i2c->dev, "enable interrupt failed\n");
-		goto exit_power_off;
-	}
-
-exit_power_off:
-	if (!power) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power off sensor failed.\n");
-			goto exit;
-		}
-	}
-exit:
-	mutex_unlock(&ltr->ops_lock);
-	return rc;
-}
-
-static int ltr553_cdev_ps_write_cal(struct sensors_classdev *sensors_cdev,
-		struct cal_result_t *cal_result)
-{
-	int power;
-	u8 ps_data[2];
-	int rc = 0;
-	struct ltr553_data *ltr = container_of(sensors_cdev,
-			struct ltr553_data, ps_cdev);
-
-	mutex_lock(&ltr->ops_lock);
-	power = ltr->power_enabled;
-	if (!power) {
-		rc = sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), true);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-	}
-
-	ltr->bias = cal_result->bias;
-	ps_data[1] = PS_LOW_BYTE(cal_result->bias);
-	ps_data[0] = PS_HIGH_BYTE(cal_result->bias);
-	rc = regmap_bulk_write(ltr->regmap, LTR553_REG_PS_OFFSET_1,
-			ps_data, 2);
-	if (rc) {
-		dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-				LTR553_REG_PS_OFFSET_1, rc);
-		goto exit_power_off;
-	}
-
-	snprintf(ltr->calibrate_buf, sizeof(ltr->calibrate_buf), "0,0,%d",
-			ltr->bias);
-
-exit_power_off:
-	if (!power) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power off sensor failed.\n");
-			goto exit;
-		}
-	}
-exit:
-
-	mutex_unlock(&ltr->ops_lock);
-	return rc;
-};
-
-static ssize_t ltr553_register_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct ltr553_data *ltr = dev_get_drvdata(dev);
-	unsigned int val;
-	int rc;
-	ssize_t count = 0;
-	int i;
-
-	if (ltr->reg_addr == LTR553_REG_MAGIC) {
-		for (i = 0; i <= 0x1f; i++) {
-			rc = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL + i,
-					&val);
-			if (rc) {
-				dev_err(&ltr->i2c->dev, "read %d failed\n",
-						LTR553_REG_ALS_CTL + i);
-				break;
-			}
-			count += snprintf(&buf[count], PAGE_SIZE,
-					"0x%x: 0x%x\n", LTR553_REG_ALS_CTL + i,
-					val);
-		}
-	} else {
-		rc = regmap_read(ltr->regmap, ltr->reg_addr, &val);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "read %d failed\n",
-					ltr->reg_addr);
-			return rc;
-		}
-		count += snprintf(&buf[count], PAGE_SIZE, "0x%x:0x%x\n",
-				ltr->reg_addr, val);
-	}
-
-	return count;
-}
-
-static ssize_t ltr553_register_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct ltr553_data *ltr = dev_get_drvdata(dev);
-	unsigned int reg;
-	unsigned int val;
-	unsigned int cmd;
-	int rc;
-
-	if (sscanf(buf, "%u %u %u\n", &cmd, &reg, &val) < 2) {
-		dev_err(&ltr->i2c->dev, "argument error\n");
-		return -EINVAL;
-	}
-
-	if (cmd == CMD_WRITE) {
-		rc = regmap_write(ltr->regmap, reg, val);
-		if (rc) {
-			dev_err(&ltr->i2c->dev, "write %d failed\n", reg);
-			return rc;
-		}
-	} else if (cmd == CMD_READ) {
-		ltr->reg_addr = reg;
-		dev_dbg(&ltr->i2c->dev, "register address set to 0x%x\n", reg);
-	}
+	mutex_lock(&data->lockw);
+	ltr559_ps_set_enable(&data->ps_cdev, (unsigned int)val);
+	mutex_unlock(&data->lockw);
 
 	return size;
 }
 
-static DEVICE_ATTR(register, S_IWUSR | S_IRUGO,
-		ltr553_register_show,
-		ltr553_register_store);
-
-static struct attribute *ltr553_attr[] = {
-	&dev_attr_register.attr,
-	NULL
-};
-
-static const struct attribute_group ltr553_attr_group = {
-	.attrs = ltr553_attr,
-};
-
-static int ltr553_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
+static ssize_t ltr559_show_enable_als(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct ltr553_data *ltr;
-	int res = 0;
+	struct ltr559_data *data = dev_get_drvdata(dev);
 
-	dev_dbg(&client->dev, "probling ltr553...\n");
+	return sprintf(buf, "%u\n", data->als_open_state);
+}
 
-	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
-		dev_err(&client->dev, "ltr553 i2c check failed.\n");
-		return -ENODEV;
-	}
+static ssize_t ltr559_store_enable_als(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t size)
+{
+	/* If proximity work, then ALS must be enable */
+	unsigned long val;
+	char *after;
+	struct ltr559_data *data = dev_get_drvdata(dev);
 
-	ltr = devm_kzalloc(&client->dev, sizeof(struct ltr553_data),
-			GFP_KERNEL);
-	if (!ltr) {
-		dev_err(&client->dev, "memory allocation failed,\n");
-		return -ENOMEM;
-	}
+	val = simple_strtoul(buf, &after, 10);
 
-	ltr->i2c = client;
+	printk(KERN_INFO "enable 559 ALS sensor -> %ld\n", val);
 
-	if (client->dev.of_node) {
-		res = ltr553_parse_dt(&client->dev, ltr);
-		if (res) {
-			dev_err(&client->dev,
-				"unable to parse device tree.(%d)\n", res);
-			goto out;
+	mutex_lock(&data->lockw);
+	ltr559_als_set_enable(&data->als_cdev, (unsigned int)val);
+	mutex_unlock(&data->lockw);
+	return size;
+}
+
+static ssize_t ltr559_driver_info_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Chip: %s %s\nVersion: %s\n",
+				VENDOR_NAME, LTR559_SENSOR_NAME, DRIVER_VERSION);
+}
+
+static ssize_t ltr559_show_debug_regs(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	u8 val, high, low;
+	int i;
+	char *after;
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = data->client;
+
+	after = buf;
+
+	after += sprintf(after, "%-17s%5s%14s%16s\n", "Register Name", "address", "default", "current");
+	for (i = 0; i < sizeof(reg_tbl)/sizeof(reg_tbl[0]); i++) {
+		if (reg_tbl[i].name == NULL || reg_tbl[i].addr == 0) {
+			break;
 		}
+		if (i < 10) {
+			val = ltr559_sensor_I2C_Read(client, reg_tbl[i].addr);
+			after += sprintf(after, "%-20s0x%02x\t  0x%02x\t\t  0x%02x\n", reg_tbl[i].name, reg_tbl[i].addr, reg_tbl[i].defval, val);
+		} else {
+			low = ltr559_sensor_I2C_Read(client, reg_tbl[i].addr);
+			high = ltr559_sensor_I2C_Read(client, reg_tbl[i].addr+1);
+			after += sprintf(after, "%-20s0x%02x\t0x%04x\t\t0x%04x\n", reg_tbl[i].name, reg_tbl[i].addr, reg_tbl[i].defval, (high << 8) + low);
+		}
+	}
+	after += sprintf(after, "\nYou can echo '0xaa=0xbb' to set the value 0xbb to the register of address 0xaa.\n ");
+
+	return after - buf;
+}
+
+static ssize_t ltr559_store_debug_regs(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t size)
+{
+	/* If proximity work, then ALS must be enable */
+	char *after, direct;
+	u8 addr, val;
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = data->client;
+
+	addr = simple_strtoul(buf, &after, 16);
+	direct = *after;
+	val = simple_strtoul((after+1), &after, 16);
+
+	if (!((addr >= 0x80 && addr <= 0x93)
+				|| (addr >= 0x97 && addr <= 0x9e)))
+		return -EINVAL;
+
+	mutex_lock(&data->lockw);
+	if (direct == '=')
+		ltr559_sensor_I2C_Wrtie(client, addr, val);
+	else
+		printk("%s: register(0x%02x) is: 0x%02x\n", __func__, addr, ltr559_sensor_I2C_Read(client, addr));
+	mutex_unlock(&data->lockw);
+
+	return after - buf;
+}
+
+static ssize_t ltr559_show_adc_data(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = data->client;
+	u8 high, low;
+	char *after;
+
+	after = buf;
+
+	low = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_0);
+	high = ltr559_sensor_I2C_Read(client, LTR559_PS_DATA_1);
+	if (low < 0 || high < 0)
+		after += sprintf(after, "Failed to read PS adc data.\n");
+	else
+		after += sprintf(after, "%d\n", (high << 8) + low);
+
+	return after - buf;
+}
+
+static ssize_t ltr559_show_lux_data(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	int lux;
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = data->client;
+
+	lux = ltr559_als_read(client);
+
+	return sprintf(buf, "%d\n", lux);
+}
+
+static DEVICE_ATTR(debug_regs, SYS_AUTHORITY, ltr559_show_debug_regs,
+				ltr559_store_debug_regs);
+static DEVICE_ATTR(enable_als_sensor, SYS_AUTHORITY, ltr559_show_enable_als,
+				ltr559_store_enable_als);
+static DEVICE_ATTR(enable, SYS_AUTHORITY, ltr559_show_enable_ps,
+				ltr559_store_enable_ps);
+static DEVICE_ATTR(info, S_IRUGO, ltr559_driver_info_show, NULL);
+static DEVICE_ATTR(raw_adc, S_IRUGO, ltr559_show_adc_data, NULL);
+static DEVICE_ATTR(lux_adc, S_IRUGO, ltr559_show_lux_data, NULL);
+
+static struct attribute *ltr559_attributes[] = {
+	&dev_attr_enable.attr,
+	&dev_attr_info.attr,
+	&dev_attr_enable_als_sensor.attr,
+	&dev_attr_debug_regs.attr,
+	&dev_attr_raw_adc.attr,
+	&dev_attr_lux_adc.attr,
+	NULL,
+};
+
+static const struct attribute_group ltr559_attr_group = {
+	.attrs = ltr559_attributes,
+};
+
+static int ltr559_als_set_poll_delay(struct ltr559_data *data, unsigned long delay)
+{
+	mutex_lock(&data->op_lock);
+	if (delay < 1)
+		delay = 1;
+	if (delay > 1000)
+		delay = 1000;
+
+	if (data->platform_data->als_poll_interval != delay) {
+		data->platform_data->als_poll_interval = delay;
+	}
+
+	if (!data->als_open_state)
+		goto workout;
+	pr_info("%s poll_interval=%d\n", __func__, data->platform_data->als_poll_interval);
+
+
+workout:
+	mutex_unlock(&data->op_lock);
+	return 0;
+}
+
+static int ltr559_als_set_enable(struct sensors_classdev *sensors_cdev,
+		unsigned int enable)
+{
+	struct ltr559_data *data = container_of(sensors_cdev, struct ltr559_data, als_cdev);
+	int ret = 0;
+
+	if ((enable != 0) && (enable != 1)) {
+		pr_err("%s: invalid value(%d)\n", __func__, enable);
+		return -EINVAL;
+	}
+
+	if (data->als_open_state != enable) {
+		ret = ltr559_als_enable(data->client, enable);
+		if (ret < 0) {
+			pr_err("%s: enable(%d) failed!\n", __func__, enable);
+			return -EFAULT;
+		}
+
+		data->als_open_state = enable;
 	} else {
-		dev_err(&client->dev, "device tree not found.\n");
-		res = -ENODEV;
-		goto out;
+		pr_err("%s: als_open_state already = %d\n", __func__, data->als_open_state);
+	}
+	pr_err("%s: enable=(%d), data->als_open_state=%d\n", __func__, enable, data->als_open_state);
+	return ret;
+}
+static int ltr559_als_poll_delay(struct sensors_classdev *sensors_cdev,
+		unsigned int delay_msec)
+{
+	struct ltr559_data *data = container_of(sensors_cdev, struct ltr559_data, als_cdev);
+	ltr559_als_set_poll_delay(data, delay_msec);
+	return 0;
+}
+
+#if defined(DYNAMIC_CALIBRATE)
+static ssize_t ltr559_ps_dynamic_caliberate_init(struct i2c_client *client, struct sensors_classdev *sensors_cdev)
+{
+	struct ltr559_data *data = container_of(sensors_cdev, struct ltr559_data, ps_cdev);
+	struct ltr559_platform_data *pdata = data->platform_data;
+	int i = 0;
+	int ps;
+	int data_total = 0;
+	int noise = 0;
+	int count = 5;
+	int max = 0;
+
+	int ret = 0;
+	int contr_data;
+
+
+	if (!data) {
+		pr_err("ltr559_data is null!!\n");
+		return -EFAULT;
 	}
 
-	dev_set_drvdata(&client->dev, ltr);
-	mutex_init(&ltr->ops_lock);
 
-	ltr->regmap = devm_regmap_init_i2c(client, &ltr553_regmap_config);
-	if (IS_ERR(ltr->regmap)) {
-		dev_err(&client->dev, "init regmap failed.(%ld)\n",
-				PTR_ERR(ltr->regmap));
-		res = PTR_ERR(ltr->regmap);
-		goto out;
+	ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, 0x0);
+	ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, 0x7ff);
+	ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, reg_tbl[REG_PS_CONTR].curval);
+
+	if (ret < 0) {
+		pr_err("%s:ps enable failed!\n", __func__);
+		return ret;
+	}
+	msleep(WAKEUP_DELAY);
+
+	contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+	if (contr_data != reg_tbl[REG_PS_CONTR].curval) {
+
+		ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, MODE_PS_StdBy);
+
+		pr_err("%s: ps status check failed!\n", __func__);
+		return -EFAULT;
 	}
 
-	res = sensor_power_init(&client->dev, power_config,
-			ARRAY_SIZE(power_config));
-	if (res) {
-		dev_err(&client->dev, "init power failed.\n");
-		goto out;
-	}
+	for (i = 0; i < count; i++) {
 
-	res = sensor_power_config(&client->dev, power_config,
-			ARRAY_SIZE(power_config), true);
-	if (res) {
-		dev_err(&client->dev, "power up sensor failed.\n");
-		goto err_power_config;
-	}
 
-	res = sensor_pinctrl_init(&client->dev, &pin_config);
-	if (res) {
-		dev_err(&client->dev, "init pinctrl failed.\n");
-		goto err_pinctrl_init;
-	}
+		msleep(10);
 
-	msleep(LTR553_BOOT_TIME_MS);
-
-	res = ltr553_check_device(ltr);
-	if (res) {
-		dev_err(&client->dev, "check device failed.\n");
-		goto err_check_device;
-	}
-
-	ltr->als_measure_rate = LTR553_ALS_DEFAULT_MEASURE_RATE;
-
-	res = ltr553_init_device(ltr);
-	if (res) {
-		dev_err(&client->dev, "check device failed.\n");
-		goto err_init_device;
-	}
-
-	/* configure interrupt */
-	if (gpio_is_valid(ltr->irq_gpio)) {
-		res = gpio_request(ltr->irq_gpio, "ltr553_interrupt");
-		if (res) {
-			dev_err(&client->dev,
-				"unable to request interrupt gpio %d\n",
-				ltr->irq_gpio);
-			goto err_request_gpio;
+		ps = ltr559_ps_read(data->client);
+		if (ps <= 0) {
+			pr_err("%s, ltr559 read data error, ps = %d!\n", __func__, ps);
+			i--;
+			continue;
 		}
 
-		res = gpio_direction_input(ltr->irq_gpio);
-		if (res) {
-			dev_err(&client->dev,
-				"unable to set direction for gpio %d\n",
-				ltr->irq_gpio);
-			goto err_set_direction;
+		if (ps & 0x8000) {
+			noise = 0;
+			data_total = 0;
+			pr_err("ltr559 read data overflow!\n");
+			break;
+		} else {
+			noise = ps;
 		}
 
-		ltr->irq = gpio_to_irq(ltr->irq_gpio);
+		data_total += ps;
 
-		res = devm_request_irq(&client->dev, ltr->irq,
-				ltr553_irq_handler,
-				ltr->irq_flags | IRQF_ONESHOT,
-				"ltr553", ltr);
+		if (max++ > 10) {
+			pr_err("ltr559 read data error!\n");
 
-		if (res) {
-			dev_err(&client->dev,
-					"request irq %d failed(%d),\n",
-					ltr->irq, res);
-			goto err_request_irq;
 		}
-
-		/* device wakeup initialization */
-		device_init_wakeup(&client->dev, 1);
-
-		disable_irq(ltr->irq);
-		ltr->workqueue = alloc_workqueue("ltr553_workqueue",
-				WQ_NON_REENTRANT | WQ_FREEZABLE, 0);
-		INIT_WORK(&ltr->report_work, ltr553_report_work);
-		INIT_WORK(&ltr->als_enable_work, ltr553_als_enable_work);
-		INIT_WORK(&ltr->als_disable_work, ltr553_als_disable_work);
-		INIT_WORK(&ltr->ps_enable_work, ltr553_ps_enable_work);
-		INIT_WORK(&ltr->ps_disable_work, ltr553_ps_disable_work);
-
-	} else {
-		res = -ENODEV;
-		goto err_init_device;
 	}
 
-	res = sysfs_create_group(&client->dev.kobj, &ltr553_attr_group);
-	if (res) {
-		dev_err(&client->dev, "sysfs create group failed\n");
-		goto err_create_group;
+	noise = data_total/count;
+
+	if (noise == 0) {
+		data->dynamic_noise = 800;
+		pdata->prox_threshold = 1000;
+		pdata->prox_hsyteresis_threshold = 900;
+	} else if (noise < (data->dynamic_noise + 200)) {
+		data->dynamic_noise = noise;
+		if (noise < 50) {
+			pdata->prox_threshold = noise+25;
+			pdata->prox_hsyteresis_threshold = noise+20;
+		} else if (noise < 100) {
+			pdata->prox_threshold = noise+40;
+			pdata->prox_hsyteresis_threshold = noise+25;
+		} else if (noise < 200) {
+			pdata->prox_threshold = noise+70;
+			pdata->prox_hsyteresis_threshold = noise+40;
+		} else if (noise < 400) {
+			pdata->prox_threshold = noise+100;
+			pdata->prox_hsyteresis_threshold = noise+50;
+		} else if (noise < 800) {
+			pdata->prox_threshold = noise+200;
+			pdata->prox_hsyteresis_threshold = noise+100;
+		} else {
+			pdata->prox_threshold = 1000;
+			pdata->prox_hsyteresis_threshold = 900;
+			pr_err("ltr559 the proximity sensor rubber or structure is error!\n");
+		}
 	}
 
-	res = ltr553_init_input(ltr);
-	if (res) {
-		dev_err(&client->dev, "init input failed.\n");
-		goto err_init_input;
+	data->cali_update = true;
+
+	printk("%s : noise = %d , thd_val_low = %d , htd_val_high = %d \n", __func__, noise, pdata->prox_hsyteresis_threshold, pdata->prox_threshold);
+
+	ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, MODE_PS_StdBy);
+	if (ret < 0) {
+		pr_err("%s: disable failed!\n", __func__);
+		return ret;
 	}
 
-	ltr->als_cdev = als_cdev;
-	ltr->als_cdev.sensors_enable = ltr553_cdev_enable_als;
-	ltr->als_cdev.sensors_poll_delay = ltr553_cdev_set_als_delay;
-	ltr->als_cdev.sensors_flush = ltr553_cdev_als_flush;
-	res = sensors_classdev_register(&ltr->input_light->dev, &ltr->als_cdev);
-	if (res) {
-		dev_err(&client->dev, "sensors class register failed.\n");
-		goto err_register_als_cdev;
+	contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+	if (contr_data != reg_tbl[REG_PS_CONTR].defval) {
+
+		pr_err("%s: disable status check failed!\n", __func__);
+		return -EFAULT;
 	}
 
-	ltr->ps_cdev = ps_cdev;
-	ltr->ps_cdev.sensors_enable = ltr553_cdev_enable_ps;
-	ltr->ps_cdev.sensors_poll_delay = ltr553_cdev_set_ps_delay;
-	ltr->ps_cdev.sensors_flush = ltr553_cdev_ps_flush;
-	ltr->ps_cdev.sensors_calibrate = ltr553_cdev_ps_calibrate;
-	ltr->ps_cdev.sensors_write_cal_params = ltr553_cdev_ps_write_cal;
-	ltr->ps_cdev.params = ltr->calibrate_buf;
-	res = sensors_classdev_register(&ltr->input_proximity->dev,
-			&ltr->ps_cdev);
-	if (res) {
-		dev_err(&client->dev, "sensors class register failed.\n");
-		goto err_register_ps_cdev;
-	}
 
-	sensor_power_config(&client->dev, power_config,
-			ARRAY_SIZE(power_config), false);
-
-	dev_dbg(&client->dev, "ltr553 successfully probed!\n");
-
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-	proximity_sensor_dev = &ltr->ps_cdev;
+	return 0;
+}
 #endif
 
-	return 0;
-
-err_register_ps_cdev:
-	sensors_classdev_unregister(&ltr->als_cdev);
-err_register_als_cdev:
-err_init_input:
-	sysfs_remove_group(&client->dev.kobj, &ltr553_attr_group);
-err_create_group:
-err_request_irq:
-err_set_direction:
-	gpio_free(ltr->irq_gpio);
-err_request_gpio:
-err_init_device:
-	device_init_wakeup(&client->dev, 0);
-err_check_device:
-err_pinctrl_init:
-	sensor_power_config(&client->dev, power_config,
-			ARRAY_SIZE(power_config), false);
-err_power_config:
-	sensor_power_deinit(&client->dev, power_config,
-			ARRAY_SIZE(power_config));
-out:
-	return res;
+/* PS open fops */
+static int ps_open(struct inode *inode, struct file *file)
+{
+	file->private_data = sensor_info;
+	return nonseekable_open(inode, file);
 }
 
-static int ltr553_remove(struct i2c_client *client)
+
+/* PS release fops */
+static int ps_release(struct inode *inode, struct file *file)
 {
-	struct ltr553_data *ltr = dev_get_drvdata(&client->dev);
 
-	sensors_classdev_unregister(&ltr->ps_cdev);
-	sensors_classdev_unregister(&ltr->als_cdev);
-
-	if (ltr->input_light)
-		input_unregister_device(ltr->input_light);
-
-	if (ltr->input_proximity)
-		input_unregister_device(ltr->input_proximity);
-
-	destroy_workqueue(ltr->workqueue);
-	device_init_wakeup(&ltr->i2c->dev, 0);
-	sensor_power_config(&client->dev, power_config,
-			ARRAY_SIZE(power_config), false);
-	sensor_power_deinit(&client->dev, power_config,
-			ARRAY_SIZE(power_config));
 	return 0;
 }
 
-static int ltr553_suspend(struct device *dev)
+/* PS IOCTL */
+static long ps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	int res = 0;
-	struct ltr553_data *ltr = dev_get_drvdata(dev);
-	u8 ps_data[4];
-	unsigned int config;
-	int idx = ltr->ps_wakeup_threshold;
+	int rc = 0, val = 0, lux = 0, enable = 0;
+	int value;
+	int psval_lo, psval_hi;
+	u16 buf[2];
+	struct ltr559_data *ltr559 = sensor_info;
+	printk("%s cmd %d\n", __func__, _IOC_NR(cmd));
 
-	dev_dbg(dev, "suspending ltr553...");
+	switch (cmd) {
 
-	mutex_lock(&ltr->ops_lock);
+	case ALSPS_REC_PS_DATA_FOR_CALI:
 
-	/* proximity is enabled */
-	if (ltr->ps_enabled) {
-		/* disable als sensor to avoid wake up by als interrupt */
-		if (ltr->als_enabled) {
-			res = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL,
-					&config);
-			if (res) {
-				dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-						LTR553_REG_ALS_CTL, res);
-				return res;
-			}
-
-			res = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-					config & (~0x1));
-			if (res) {
-				dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-						LTR553_REG_ALS_CTL, res);
-				goto exit;
-			}
+		if (get_user(val, (unsigned long __user *)arg)) {
+			rc = -EFAULT;
+		break;
 		}
+		if (val == 0)
+			val = 300;
+		#if !(DYNAMIC_CALIBRATE)
+		ltr559->platform_data->prox_hsyteresis_threshold = val + FAR_THRES_DATA;
+		ltr559->platform_data->prox_threshold = val + NEAR_THRES_DATA;
+		#endif
 
-		/* Don't power off sensor because proximity is a
-		 * wake up sensor.
-		 */
-		if (device_may_wakeup(&ltr->i2c->dev)) {
-			dev_dbg(&ltr->i2c->dev, "enable irq wake\n");
-			enable_irq_wake(ltr->irq);
+		ltr559_set_ps_threshold(ltr559->client, LTR559_PS_THRES_LOW_0, val + FAR_THRES_DATA);
+		ltr559_set_ps_threshold(ltr559->client, LTR559_PS_THRES_UP_0, val + NEAR_THRES_DATA);
+		printk("ltr559--- nv data = %d\n", val);
+		break;
+	case ALSPS_GET_PS_RAW_DATA_FOR_CALI:
+		psval_lo = ltr559_sensor_I2C_Read(ltr559->client, LTR559_PS_DATA_0);
+		if (psval_lo < 0) {
+			return psval_lo;
 		}
+		psval_hi = ltr559_sensor_I2C_Read(ltr559->client, LTR559_PS_DATA_1);
+		if (psval_hi < 0) {
+			return psval_hi;
+		}
+		value = ((psval_hi & 7) << 8) | psval_lo;
+		buf[0] = value;
+		buf[1] = ltr559->ps_state;
 
-		/* Setup threshold to avoid frequent wakeup */
-		if (device_may_wakeup(&ltr->i2c->dev) &&
-				(idx != LTR553_WAKEUP_ANY_CHANGE)) {
-			dev_dbg(&ltr->i2c->dev, "last ps: %d\n", ltr->last_ps);
-			if (ltr->last_ps > idx) {
-				ps_data[2] = 0x0;
-				ps_data[3] = 0x0;
-				ps_data[0] =
-					PS_LOW_BYTE(ps_distance_table[idx]);
-				ps_data[1] =
-					PS_HIGH_BYTE(ps_distance_table[idx]);
+		if (copy_to_user((unsigned long __user *)arg, buf, sizeof(buf)))
+			return -EFAULT;
+		printk("ltr559--- fastmmi rawdata = %d, ltr559->ps_state=%d\n", value, ltr559->ps_state);
+		break;
+	case ALSPS_LSENSOR_LUX_DATA:
+		lux = ltr559_als_read(ltr559->client);
+		put_user(lux, (unsigned long __user *)arg);
+		printk("ltr559--- lsensor-lux = %d\n", lux);
+		break;
+	case ALSPS_PSENSOR_ABS_DISTANCE_DATA:
+		put_user(ltr559->ps_state, (unsigned long __user *)arg);
+		printk("ltr559--- distance_flag = %d\n", ltr559->ps_state);
+		break;
+
+	case ALSPS_PS_ENABLE:
+		if (get_user(enable, (unsigned long __user *)arg)) {
+			rc = -EFAULT;
+		break;
+		}
+		printk("ltr559 ps_enable = %d\n", enable);
+		ltr559_ps_set_enable(&ltr559->ps_cdev, (unsigned int)enable);
+		break;
+
+	case ALSPS_LS_ENABLE:
+		if (get_user(enable, (unsigned long __user *)arg)) {
+			rc = -EFAULT;
+		break;
+		}
+		printk("ltr559 ls_enable = %d\n", enable);
+		ltr559_als_set_enable(&ltr559->als_cdev, (unsigned int)enable);
+
+		break;
+	default:
+		pr_err("%s: INVALID COMMAND %d\n",
+			__func__, _IOC_NR(cmd));
+		rc = -EINVAL;
+	}
+
+		return 0;
+}
+
+static const struct file_operations ps_fops = {
+	.owner = THIS_MODULE,
+	.open = ps_open,
+	.release = ps_release,
+	.unlocked_ioctl = ps_ioctl,
+};
+
+struct miscdevice ps_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "psensor",
+	.fops = &ps_fops,
+};
+
+static int ltr559_ps_set_enable(struct sensors_classdev *sensors_cdev,
+		unsigned int enable)
+{
+	struct ltr559_data *data = container_of(sensors_cdev, struct ltr559_data, ps_cdev);
+	int ret = 0;
+
+	printk("%s: enable(%d) start!\n", __func__, enable);
+
+	if ((enable != 0) && (enable != 1)) {
+		pr_err("%s: invalid value(%d)\n", __func__, enable);
+		return -EINVAL;
+	}
+
+	ret = ltr559_ps_enable(data->client, enable);
+	if (ret < 0) {
+		pr_err("%s: enable(%d) failed!\n", __func__, enable);
+		return -EFAULT;
+	}
+
+	data->ps_open_state = enable;
+	pr_err("%s: enable=(%d), data->ps_open_state=%d\n", __func__, enable, data->ps_open_state);
+	return ret;
+}
+
+static int ltr559_suspend(struct device *dev)
+{
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	int ret = 0;
+
+	printk("%s\n", __func__);
+	mutex_lock(&data->lockw);
+	ret |= ltr559_als_enable(data->client, 0);
+	mutex_unlock(&data->lockw);
+	return ret;
+}
+
+static int ltr559_resume(struct device *dev)
+{
+	struct ltr559_data *data = dev_get_drvdata(dev);
+	int ret;
+
+	printk("%s\n", __func__);
+	mutex_lock(&data->lockw);
+	if (data->als_open_state == 1)
+		ret = ltr559_als_enable(data->client, 1);
+	mutex_unlock(&data->lockw);
+	return ret;
+}
+
+#ifdef CONFIG_PSENSOR_ONDEMAND_STATE
+int ltr559_ps_ondemand_state (void)
+{
+    struct ltr559_data *data = container_of(proximity_sensor_dev, struct ltr559_data, ps_cdev);
+    struct i2c_client *client = data->client;
+    int contr_data;
+
+    u32	ondemand_ps_state = 0;
+    u32 psdata = 0;
+    int proximity_state = LTR559_ON_DEMAND_RESET;
+    int ret = 0;
+
+    ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, reg_tbl[REG_PS_CONTR].curval);
+    msleep(WAKEUP_DELAY);
+
+    if (ret < 0) {
+	pr_err("%s: enable=(%d) failed!\n", __func__, 1);
+	return ret;
+    }
+    contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+    if (contr_data != reg_tbl[REG_PS_CONTR].curval) {
+
+	pr_err("%s: enable=(%d) failed!\n", __func__, 1);
+	return -EFAULT;
+    }
+
+    data->ps_state = 1;
+    ps_state_last = 1;
+
+    ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, data->platform_data->prox_threshold);
+    ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, data->platform_data->prox_threshold-1);
+
+    input_report_abs(data->input_dev_ps, ABS_DISTANCE, data->ps_state);
+    input_sync(data->input_dev_ps);
+
+    /* Read the proximity data */
+    psdata = ltr559_ps_read(client);
+    printk("%s ps data =%d(0x%x) \n", __func__, psdata, psdata);
+
+    /* Classify the data */
+    if (psdata >= data->platform_data->prox_threshold) {
+	ondemand_ps_state= 0;
+    } else if (psdata <= data->platform_data->prox_hsyteresis_threshold) {
+	ondemand_ps_state = 1;
+    } else {
+	ondemand_ps_state = ps_state_last;
+    }
+
+    printk("%s, current ps_open_state  %s\n", __func__, data->ps_open_state ?  "OPENED" : "CLOSED");
+    if (ps_state_last != ondemand_ps_state) {
+	printk("%s, ps_state changed to %s\n", __func__, ondemand_ps_state ? "far" : "near");
+	ps_state_last = data->ps_state;
+    } else
+	printk("%s, ps_state still %s\n", __func__, ondemand_ps_state ? "far" : "near");
+
+    ltr559_set_ps_threshold(client, LTR559_PS_THRES_LOW_0, 0);
+    ltr559_set_ps_threshold(client, LTR559_PS_THRES_UP_0, 0x7ff);
+
+
+    ret = ltr559_sensor_I2C_Wrtie(client, LTR559_PS_CONTR, MODE_PS_StdBy);
+    if (ret < 0) {
+	pr_err("%s: enable=(%d) failed!\n", __func__, 0);
+	return ret;
+    }
+
+    contr_data = ltr559_sensor_I2C_Read(client, LTR559_PS_CONTR);
+    if (contr_data != reg_tbl[REG_PS_CONTR].defval) {
+	pr_err("%s:  enable=(%d) failed!\n", __func__, 0);
+	return -EFAULT;
+    }
+
+    data->ps_state = 0xff;
+    input_report_abs(data->input_dev_ps, ABS_DISTANCE, data->ps_state);
+    input_sync(data->input_dev_ps);
+
+    proximity_state = (ondemand_ps_state == 0) ? LTR559_ON_DEMAND_COVERED 
+	: LTR559_ON_DEMAND_UNCOVERED;
+
+    return (proximity_state);
+}
+#endif /* CONFIG_PSENSOR_ONDEMAND_STATE */
+
+static int ltr559_check_chip_id(struct i2c_client *client)
+{
+	int id;
+
+	id = ltr559_sensor_I2C_Read(client, LTR559_MANUFACTURER_ID);
+	printk("%s read the  LTR559_MANUFAC_ID is 0x%x\n", __func__, id);
+	if (id != LTR559_MANUFAC_ID) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+int ltr559_device_init(struct i2c_client *client)
+{
+	int retval = 0;
+	int i;
+
+	retval = ltr559_sensor_I2C_Wrtie(client, LTR559_ALS_CONTR, 0x02);
+	if (retval < 0) {
+		pr_err("%s   i2c_smbus_write_byte_data(LTR559_ALS_CONTR, 0x02);  ERROR !!!.\n", __func__);
+	}
+
+	msleep(WAKEUP_DELAY);
+	for (i = 2; i < sizeof(reg_tbl)/sizeof(reg_tbl[0]); i++) {
+		if (reg_tbl[i].name == NULL || reg_tbl[i].addr == 0) {
+			break;
+		}
+		if (reg_tbl[i].defval != reg_tbl[i].curval) {
+			if (i < 10) {
+				retval = ltr559_sensor_I2C_Wrtie(client, reg_tbl[i].addr, reg_tbl[i].curval);
+				pr_info("___CAOYI____  ltr559  write 0x%x to addr:0x%x\n", reg_tbl[i].curval, reg_tbl[i].addr);
+				pr_info("___CAOYI____ write is OK(0) or Error (-x) ? = return is %d\n", ltr559_sensor_I2C_Wrtie(client, reg_tbl[i].addr, reg_tbl[i].curval));
 			} else {
-				ps_data[2] =
-					PS_LOW_BYTE(ps_distance_table[idx]);
-				ps_data[3] =
-					PS_HIGH_BYTE(ps_distance_table[idx]);
-				ps_data[0] = PS_LOW_BYTE(PS_DATA_MASK);
-				ps_data[1] = PS_HIGH_BYTE(PS_DATA_MASK);
-			}
-
-			res = regmap_bulk_write(ltr->regmap,
-					LTR553_REG_PS_THRES_UP_0, ps_data, 4);
-			if (res) {
-				dev_err(&ltr->i2c->dev, "set up threshold failed\n");
-				goto exit;
+				retval = ltr559_sensor_I2C_Wrtie(client, reg_tbl[i].addr, reg_tbl[i].curval & 0xff);
+				pr_info("___CAOYI____  ltr559  write 0x%x to addr:0x%x\n", reg_tbl[i].curval & 0xff, reg_tbl[i].addr);
+				retval = ltr559_sensor_I2C_Wrtie(client, reg_tbl[i].addr + 1, reg_tbl[i].curval >> 8);
+				pr_info("___CAOYI____  ltr559  write 0x%x to addr:0x%x\n", reg_tbl[i].curval >> 8, reg_tbl[i].addr);
 			}
 		}
-	} else {
-		/* power off */
-		if (ltr->als_enabled)
-			disable_irq(ltr->irq);
-		if (ltr->power_enabled) {
-			res = sensor_power_config(dev, power_config,
-					ARRAY_SIZE(power_config), false);
-			if (res) {
-				dev_err(dev, "failed to suspend ltr553\n");
-				goto exit;
-			}
-		}
-		pinctrl_select_state(pin_config.pinctrl, pin_config.state[1]);
 	}
-exit:
-	mutex_unlock(&ltr->ops_lock);
-	return res;
+
+	pr_info("___CAOYI______ read addr 0x9e is 0x%x\n", ltr559_sensor_I2C_Read(client, 0x9e));
+	pr_info("___CAOYI______ read addr 0x90 is 0x%x\n", ltr559_sensor_I2C_Read(client, 0x90));
+
+
+	pr_info("___CAOYI______||||   read is OK(+x) or Error (-x) ? = return is %d\n", ltr559_sensor_I2C_Read(client, 0x1a));
+	pr_info("___CAOYI______||||  write is OK(0) or Error (-x) ? = return is %d\n", ltr559_sensor_I2C_Wrtie(client, 0x1b, 0x88));
+	pr_info("___CAOYI______||||  write is OK(0) or Error (-x) ? = return is %d\n", ltr559_sensor_I2C_Wrtie(client, 0x11, 0x88));
+
+	return retval;
 }
 
-static int ltr553_resume(struct device *dev)
+static int sensor_regulator_configure(struct ltr559_data *data, bool on)
 {
-	int res = 0;
-	struct ltr553_data *ltr = dev_get_drvdata(dev);
-	unsigned int config;
+	int rc;
 
-	dev_dbg(dev, "resuming ltr553...");
-	if (ltr->ps_enabled) {
-		if (device_may_wakeup(&ltr->i2c->dev)) {
-			dev_dbg(&ltr->i2c->dev, "disable irq wake\n");
-			disable_irq_wake(ltr->irq);
-		}
+	if (!on) {
+		if (regulator_count_voltages(data->vdd) > 0)
+			regulator_set_voltage(data->vdd, 0, LTR559_VDD_MAX_UV);
+		regulator_put(data->vdd);
 
-		if (ltr->als_enabled) {
-			res = regmap_read(ltr->regmap, LTR553_REG_ALS_CTL,
-					&config);
-			if (res) {
-				dev_err(&ltr->i2c->dev, "read %d failed.(%d)\n",
-						LTR553_REG_ALS_CTL, res);
-				goto exit;
-			}
-
-			res = regmap_write(ltr->regmap, LTR553_REG_ALS_CTL,
-					config | 0x1);
-			if (res) {
-				dev_err(&ltr->i2c->dev, "write %d failed.(%d)\n",
-						LTR553_REG_ALS_CTL, res);
-				goto exit;
-			}
-		}
+		if (regulator_count_voltages(data->vio) > 0)
+			regulator_set_voltage(data->vio, 0, LTR559_VIO_MAX_UV);
+		regulator_put(data->vio);
 	} else {
-		pinctrl_select_state(pin_config.pinctrl, pin_config.state[0]);
-		/* Power up sensor */
-		if (ltr->power_enabled) {
-			res = sensor_power_config(dev, power_config,
-					ARRAY_SIZE(power_config), true);
-			if (res) {
-				dev_err(dev, "failed to power up ltr553\n");
-				goto exit;
-			}
-			msleep(LTR553_BOOT_TIME_MS);
+		data->vdd = regulator_get(&data->client->dev, "vdd");
+		if (IS_ERR(data->vdd)) {
+			rc = PTR_ERR(data->vdd);
+			dev_err(&data->client->dev, "Regulator get failed vdd rc=%d\n", rc);
+			return rc;
+		}
 
-			res = ltr553_init_device(ltr);
-			if (res) {
-				dev_err(dev, "failed to init ltr553\n");
-				goto exit_power_off;
+		if (regulator_count_voltages(data->vdd) > 0) {
+			rc = regulator_set_voltage(data->vdd, LTR559_VDD_MIN_UV, LTR559_VDD_MAX_UV);
+			if (rc) {
+				dev_err(&data->client->dev, "Regulator set failed vdd rc=%d\n", rc);
+				goto reg_vdd_put;
 			}
 		}
 
-		if (ltr->als_enabled) {
-			res = ltr553_enable_als(ltr, ltr->als_enabled);
-			if (res) {
-				dev_err(dev, "failed to enable ltr553\n");
-				goto exit_power_off;
+		data->vio = regulator_get(&data->client->dev, "vio");
+		if (IS_ERR(data->vio)) {
+			rc = PTR_ERR(data->vio);
+			dev_err(&data->client->dev, "Regulator get failed vio rc=%d\n", rc);
+			goto reg_vdd_set;
+		}
+
+		if (regulator_count_voltages(data->vio) > 0) {
+			rc = regulator_set_voltage(data->vio, LTR559_VIO_MIN_UV, LTR559_VIO_MAX_UV);
+			if (rc) {
+				dev_err(&data->client->dev, "Regulator set failed vio rc=%d\n", rc);
+				goto reg_vio_put;
 			}
 		}
 	}
 
-	return res;
+	return 0;
+reg_vio_put:
+	regulator_put(data->vio);
 
-exit_power_off:
-	if ((!ltr->als_enabled) && (!ltr->ps_enabled) &&
-			ltr->power_enabled) {
-		if (sensor_power_config(&ltr->i2c->dev, power_config,
-					ARRAY_SIZE(power_config), false)) {
-			dev_err(&ltr->i2c->dev, "power up sensor failed.\n");
-			goto exit;
-		}
-		ltr->power_enabled = false;
-	}
-
-exit:
-	return res;
+reg_vdd_set:
+	if (regulator_count_voltages(data->vdd) > 0)
+		regulator_set_voltage(data->vdd, 0, LTR559_VDD_MAX_UV);
+reg_vdd_put:
+	regulator_put(data->vdd);
+	return rc;
 }
 
-static const struct i2c_device_id ltr553_id[] = {
-	{ LTR553_I2C_NAME, 0 },
-	{ }
+static int sensor_regulator_power_on(struct ltr559_data *data, bool on)
+{
+	int rc = 0;
+
+	if (!on) {
+		rc = regulator_disable(data->vdd);
+		if (rc) {
+			dev_err(&data->client->dev, "Regulator vdd disable failed rc=%d\n", rc);
+			return rc;
+		}
+
+		rc = regulator_disable(data->vio);
+		if (rc) {
+			dev_err(&data->client->dev, "Regulator vio disable failed rc=%d\n", rc);
+			rc = regulator_enable(data->vdd);
+			dev_err(&data->client->dev, "Regulator vio re-enabled rc=%d\n", rc);
+			/*
+			 * Successfully re-enable regulator.
+			 * Enter poweron delay and returns error.
+			 */
+			if (!rc) {
+				rc = -EBUSY;
+				goto enable_delay;
+			}
+		}
+		return rc;
+	} else {
+		rc = regulator_enable(data->vdd);
+		if (rc) {
+			dev_err(&data->client->dev, "Regulator vdd enable failed rc=%d\n", rc);
+			return rc;
+		}
+
+		rc = regulator_enable(data->vio);
+		if (rc) {
+			dev_err(&data->client->dev, "Regulator vio enable failed rc=%d\n", rc);
+			regulator_disable(data->vdd);
+			return rc;
+		}
+	}
+
+enable_delay:
+	msleep(130);
+	dev_dbg(&data->client->dev, "Sensor regulator power on =%d\n", on);
+	return rc;
+}
+
+static int sensor_platform_hw_power_onoff(struct ltr559_data *data, bool on)
+{
+	int err = 0;
+
+	if (data->power_state != on) {
+		if (on) {
+			if (!IS_ERR_OR_NULL(data->pinctrl)) {
+				err = pinctrl_select_state(data->pinctrl, data->pin_default);
+				if (err) {
+					dev_err(&data->client->dev, "Can't select pinctrl state on=%d\n", on);
+					goto power_out;
+				}
+			}
+
+			err = sensor_regulator_configure(data, true);
+			if (err) {
+				dev_err(&data->client->dev, "unable to configure regulator on=%d\n", on);
+				goto power_out;
+			}
+
+			err = sensor_regulator_power_on(data, true);
+			if (err) {
+				dev_err(&data->client->dev, "Can't configure regulator on=%d\n", on);
+				goto power_out;
+			}
+
+			data->power_state = true;
+		} else {
+			if (!IS_ERR_OR_NULL(data->pinctrl)) {
+				err = pinctrl_select_state(data->pinctrl, data->pin_sleep);
+				if (err) {
+					dev_err(&data->client->dev, "Can't select pinctrl state on=%d\n", on);
+					goto power_out;
+				}
+			}
+
+			err = sensor_regulator_power_on(data, false);
+			if (err) {
+				dev_err(&data->client->dev, "Can't configure regulator on=%d\n", on);
+				goto power_out;
+			}
+
+			err = sensor_regulator_configure(data, false);
+			if (err) {
+				dev_err(&data->client->dev, "unable to configure regulator on=%d\n", on);
+				goto power_out;
+			}
+
+			data->power_state = false;
+		}
+	}
+power_out:
+	return err;
+}
+
+static int ltr559_pinctrl_init(struct ltr559_data *data)
+{
+	struct i2c_client *client = data->client;
+
+	data->pinctrl = devm_pinctrl_get(&client->dev);
+	if (IS_ERR_OR_NULL(data->pinctrl)) {
+		dev_err(&client->dev, "Failed to get pinctrl\n");
+		return PTR_ERR(data->pinctrl);
+	}
+
+	data->pin_default =
+		pinctrl_lookup_state(data->pinctrl, "default");
+	if (IS_ERR_OR_NULL(data->pin_default)) {
+		dev_err(&client->dev, "Failed to look up default state\n");
+		return PTR_ERR(data->pin_default);
+	}
+
+	data->pin_sleep =
+		pinctrl_lookup_state(data->pinctrl, "sleep");
+	if (IS_ERR_OR_NULL(data->pin_sleep)) {
+		dev_err(&client->dev, "Failed to look up sleep state\n");
+		return PTR_ERR(data->pin_sleep);
+	}
+
+	return 0;
+}
+
+static int ltr559_parse_dt(struct device *dev, struct ltr559_data *data)
+{
+	struct ltr559_platform_data *pdata = data->platform_data;
+	struct device_node *np = dev->of_node;
+	unsigned int tmp;
+	int rc = 0;
+
+	/* ps tuning data*/
+	rc = of_property_read_u32(np, "ltr,ps-threshold", &tmp);
+	if (rc) {
+		dev_err(dev, "Unable to read ps threshold\n");
+		return rc;
+	}
+	pdata->prox_threshold = tmp;
+
+	rc = of_property_read_u32(np, "ltr,ps-hysteresis-threshold", &tmp);
+	 if (rc) {
+		dev_err(dev, "Unable to read ps hysteresis threshold\n");
+		return rc;
+	}
+	pdata->prox_hsyteresis_threshold = tmp;
+
+	rc = of_property_read_u32(np, "ltr,als-polling-time", &tmp);
+	 if (rc) {
+		dev_err(dev, "Unable to read ps hysteresis threshold\n");
+		return rc;
+	}
+	pdata->als_poll_interval = tmp;
+
+	return 0;
+}
+
+int ltr559_probe(struct i2c_client *client, const struct i2c_device_id *id)
+{
+	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
+	struct ltr559_data *data;
+	struct ltr559_platform_data *pdata;
+	int ret = 0;
+
+	wing_info("start...\n");
+
+	/* check i2c*/
+	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_WRITE_BYTE | I2C_FUNC_SMBUS_READ_BYTE_DATA)) {
+		dev_err(&client->dev, "LTR-559ALS functionality check failed.\n");
+		return -EIO;
+	}
+
+	/* platform data memory allocation*/
+	if (client->dev.of_node) {
+		pdata = devm_kzalloc(&client->dev,
+				sizeof(struct ltr559_platform_data),
+				GFP_KERNEL);
+		if (!pdata) {
+			dev_err(&client->dev, "Failed to allocate memory\n");
+			return -ENOMEM;
+		}
+
+		client->dev.platform_data = pdata;
+	} else {
+		pdata = client->dev.platform_data;
+		if (!pdata) {
+			dev_err(&client->dev, "No platform data\n");
+			return -ENODEV;
+		}
+	}
+
+	/* data memory allocation */
+	data = kzalloc(sizeof(struct ltr559_data), GFP_KERNEL);
+	if (!data) {
+		dev_err(&client->dev, "kzalloc failed\n");
+		ret = -ENOMEM;
+		goto exit_kfree_pdata;
+	}
+	data->client = client;
+	data->platform_data = pdata;
+	sensor_info = data;
+	ret = ltr559_parse_dt(&client->dev, data);
+	if (ret) {
+		dev_err(&client->dev, "can't parse platform data\n");
+		ret = -EFAULT;
+		goto exit_kfree_data;
+	}
+	data->dynamic_noise = 2047;
+	/* pinctrl initialization */
+	ret = ltr559_pinctrl_init(data);
+	if (ret) {
+		ret = -EFAULT;
+		dev_err(&client->dev, "Can't initialize pinctrl\n");
+		goto exit_kfree_data;
+	}
+
+	/* power initialization */
+	ret = sensor_platform_hw_power_onoff(data, true);
+	if (ret) {
+		ret = -ENOEXEC;
+		dev_err(&client->dev, "power on fail\n");
+		goto exit_kfree_data;
+	}
+
+	wake_lock_init(&data->ps_wakelock, WAKE_LOCK_SUSPEND, "proximity");
+
+	/* set client data as ltr559_data*/
+	i2c_set_clientdata(client, data);
+
+	ret = ltr559_check_chip_id(client);
+	if (ret) {
+		ret = -ENXIO;
+		dev_err(&client->dev, "the manufacture id is not match\n");
+		goto exit_power_off;
+	}
+
+	ret = ltr559_device_init(client);
+	if (ret) {
+		ret = -ENXIO;
+		dev_err(&client->dev, "device init failed\n");
+		goto exit_power_off;
+	}
+
+	/* request gpio and irq */
+	ret = ltr559_gpio_irq(data);
+	if (ret) {
+		ret = -ENXIO;
+		dev_err(&client->dev, "gpio_irq failed\n");
+		goto exit_chip_reset;
+	}
+
+	/* Register Input Device */
+	data->input_dev_als = input_allocate_device();
+	if (!data->input_dev_als) {
+		ret = -ENOMEM;
+		dev_err(&client->dev, "Failed to allocate input device als\n");
+		goto exit_free_irq;
+	}
+
+	data->input_dev_ps = input_allocate_device();
+	if (!data->input_dev_ps) {
+		ret = -ENOMEM;
+		dev_err(&client->dev, "Failed to allocate input device ps\n");
+		goto exit_free_dev_als;
+	}
+
+	set_bit(EV_ABS, data->input_dev_als->evbit);
+	set_bit(EV_ABS, data->input_dev_ps->evbit);
+
+	input_set_abs_params(data->input_dev_als, ABS_MISC, 0, 65535, 0, 0);
+	input_set_abs_params(data->input_dev_ps, ABS_DISTANCE, 0, 1, 0, 0);
+
+#if defined (CONFIG_SENSORS_BMM050) || defined(CONFIG_L9100_COMMON) || defined(CONFIG_L8150_COMMON1111111)
+	data->input_dev_als->name = "ltr559-ls";
+	data->input_dev_ps->name = "ltr559-ps";
+#else
+	data->input_dev_als->name = "light";
+	data->input_dev_ps->name = "proximity";
+#endif
+	data->input_dev_als->id.bustype = BUS_I2C;
+	data->input_dev_als->dev.parent = &data->client->dev;
+	data->input_dev_ps->id.bustype = BUS_I2C;
+	data->input_dev_ps->dev.parent = &data->client->dev;
+
+	input_set_drvdata(data->input_dev_als, data);
+	input_set_drvdata(data->input_dev_ps, data);
+
+	ret = input_register_device(data->input_dev_als);
+	if (ret) {
+		ret = -ENOMEM;
+		dev_err(&client->dev, "Unable to register input device als: %s\n", data->input_dev_als->name);
+		goto exit_free_dev_ps;
+	}
+
+	ret = input_register_device(data->input_dev_ps);
+	if (ret) {
+		ret = -ENOMEM;
+		dev_err(&client->dev, "Unable to register input device ps: %s\n", data->input_dev_ps->name);
+		goto exit_unregister_dev_als;
+	}
+	printk("%s input device success.\n", __func__);
+	ret = misc_register(&ps_misc);
+	if (ret < 0) {
+		dev_err(&data->client->dev,
+		"%s: PS Register Misc Device Fail...\n", __func__);
+		goto  exit_free_dev_als;
+	}
+	/* init delayed works */
+	INIT_DELAYED_WORK(&data->ps_work, ltr559_ps_work_func);
+	INIT_DELAYED_WORK(&data->als_work, ltr559_als_work_func);
+
+	/* init mutex */
+	mutex_init(&data->lockw);
+	mutex_init(&data->op_lock);
+
+	/* create sysfs group */
+	ret = sysfs_create_group(&client->dev.kobj, &ltr559_attr_group);
+
+#if defined (CONFIG_SENSORS_BMM050) || defined(CONFIG_L9100_COMMON) || defined(DYNAMIC_CALIBRATE)
+	ret = sysfs_create_group(&data->input_dev_als->dev.kobj, &ltr559_attr_group);
+	ret = sysfs_create_group(&data->input_dev_ps->dev.kobj, &ltr559_attr_group);
+#endif
+
+	if (ret) {
+		ret = -EROFS;
+		dev_err(&client->dev, "Unable to creat sysfs group\n");
+		goto exit_unregister_dev_ps;
+	}
+
+	/* Register sensors class */
+	data->als_cdev = sensors_light_cdev;
+	data->als_cdev.sensors_enable = ltr559_als_set_enable;
+	data->als_cdev.sensors_poll_delay = ltr559_als_poll_delay;
+	data->ps_cdev = sensors_proximity_cdev;
+	data->ps_cdev.sensors_enable = ltr559_ps_set_enable;
+	data->ps_cdev.sensors_poll_delay = NULL;
+
+	ret = sensors_classdev_register(&client->dev, &data->als_cdev);
+	if (ret) {
+		ret = -EROFS;
+		dev_err(&client->dev, "Unable to register to als sensor class\n");
+		goto exit_remove_sysfs_group;
+	}
+
+	ret = sensors_classdev_register(&client->dev, &data->ps_cdev);
+	if (ret) {
+		ret = -EROFS;
+		dev_err(&client->dev, "Unable to register to ps sensor class\n");
+		goto exit_unregister_als_class;
+	}
+
+
+#if defined(DYNAMIC_CALIBRATE)
+	if (0 != ltr559_ps_dynamic_caliberate_init(client, &data->ps_cdev)) {
+		pr_err("%s, dynamic calibrate fail!", __func__);
+		data->dynamic_noise = 800;
+		pdata->prox_threshold = 1000;
+		pdata->prox_hsyteresis_threshold = 900;
+	}
+#endif
+
+	dev_dbg(&client->dev, "probe succece\n");
+
+#ifdef CONFIG_PSENSOR_ONDEMAND_STATE
+	proximity_sensor_dev = &data->ps_cdev;
+#endif
+
+	wing_info("success.\n");
+	return 0;
+
+exit_unregister_als_class:
+	sensors_classdev_unregister(&data->als_cdev);
+exit_remove_sysfs_group:
+	sysfs_remove_group(&client->dev.kobj, &ltr559_attr_group);
+#if defined (CONFIG_SENSORS_BMM050) || defined(CONFIG_L9100_COMMON) || defined(DYNAMIC_CALIBRATE)
+	sysfs_remove_group(&data->input_dev_als->dev.kobj, &ltr559_attr_group);
+	sysfs_remove_group(&data->input_dev_ps->dev.kobj, &ltr559_attr_group);
+#endif
+exit_unregister_dev_ps:
+	input_unregister_device(data->input_dev_ps);
+exit_unregister_dev_als:
+	input_unregister_device(data->input_dev_als);
+exit_free_dev_ps:
+	if (data->input_dev_ps)
+		input_free_device(data->input_dev_ps);
+exit_free_dev_als:
+	if (data->input_dev_als)
+		input_free_device(data->input_dev_als);
+exit_free_irq:
+	ltr559_gpio_irq_free(data);
+exit_chip_reset:
+	ltr559_chip_reset(client);
+exit_power_off:
+	sensor_platform_hw_power_onoff(data, false);
+	wake_lock_destroy(&data->ps_wakelock);
+
+exit_kfree_pdata:
+	if (pdata && (client->dev.of_node))
+		devm_kfree(&client->dev, pdata);
+	data->platform_data = NULL;
+	pdata = NULL;
+
+
+exit_kfree_data:
+	kfree(data);
+
+	wing_info("failed.\n");
+	return ret;
+}
+
+static int ltr559_remove(struct i2c_client *client)
+{
+	struct ltr559_data *data = i2c_get_clientdata(client);
+	struct ltr559_platform_data *pdata = data->platform_data;
+
+	if (data == NULL || pdata == NULL)
+		return 0;
+
+	ltr559_ps_enable(client, 0);
+	ltr559_als_enable(client, 0);
+	input_unregister_device(data->input_dev_als);
+	input_unregister_device(data->input_dev_ps);
+
+	input_free_device(data->input_dev_als);
+	input_free_device(data->input_dev_ps);
+
+	ltr559_gpio_irq_free(data);
+
+	sysfs_remove_group(&client->dev.kobj, &ltr559_attr_group);
+#if defined (CONFIG_SENSORS_BMM050) || defined(CONFIG_L9100_COMMON) || defined(DYNAMIC_CALIBRATE)
+	sysfs_remove_group(&data->input_dev_als->dev.kobj, &ltr559_attr_group);
+	sysfs_remove_group(&data->input_dev_ps->dev.kobj, &ltr559_attr_group);
+#endif
+
+	cancel_delayed_work_sync(&data->ps_work);
+	cancel_delayed_work_sync(&data->als_work);
+
+	if (pdata && (client->dev.of_node))
+		devm_kfree(&client->dev, pdata);
+	pdata = NULL;
+
+	wake_lock_destroy(&data->ps_wakelock);
+
+	kfree(data);
+	data = NULL;
+
+	return 0;
+}
+
+static struct i2c_device_id ltr559_id[] = {
+	{"ltr559", 0},
+	{}
 };
 
-static struct of_device_id ltr553_match_table[] = {
-	{ .compatible = "liteon,ltr553", },
-	{ },
+static struct of_device_id ltr_match_table[] = {
+	{.compatible = "ltr,ltr559",},
+	{},
 };
 
-static const struct dev_pm_ops ltr553_pm_ops = {
-	.suspend = ltr553_suspend,
-	.resume = ltr553_resume,
-};
-
-static struct i2c_driver ltr553_driver = {
-	.probe = ltr553_probe,
-	.remove = ltr553_remove,
-	.id_table = ltr553_id,
+MODULE_DEVICE_TABLE(i2c, ltr559_id);
+static SIMPLE_DEV_PM_OPS(ltr559_pm_ops, ltr559_suspend, ltr559_resume);
+static struct i2c_driver ltr559_driver = {
 	.driver = {
+		.name = LTR559_DRV_NAME,
 		.owner = THIS_MODULE,
-		.name = LTR553_I2C_NAME,
-		.of_match_table = ltr553_match_table,
-		.pm = &ltr553_pm_ops,
+		.pm = &ltr559_pm_ops,
+		.of_match_table = ltr_match_table,
 	},
+	.probe = ltr559_probe,
+	.remove = ltr559_remove,
+	.id_table = ltr559_id,
 };
 
-module_i2c_driver(ltr553_driver);
+static int ltr559_driver_init(void)
+{
+	pr_info("Driver ltr5590 init.\n");
+	return i2c_add_driver(&ltr559_driver);
+};
 
-MODULE_DESCRIPTION("LTR-553ALPS Driver");
+static void ltr559_driver_exit(void)
+{
+	pr_info("Unload ltr559 module...\n");
+	i2c_del_driver(&ltr559_driver);
+}
+
+module_init(ltr559_driver_init);
+module_exit(ltr559_driver_exit);
+MODULE_AUTHOR("Lite-On Technology Corp.");
+MODULE_DESCRIPTION("Lite-On LTR-559 Proximity and Light Sensor Driver");
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION("1.0");
 
