@@ -36,7 +36,6 @@
 
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 #include <linux/input/prevent_sleep.h>
-bool dit_suspend = false;
 #endif
 
 #if CTP_CHARGER_DETECT
@@ -476,6 +475,7 @@ static int ft5x06_ts_suspend(struct device *dev)
 	int err;
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 	bool prevent_sleep = false;
+	bool dit_suspend = false;
 #endif
 
 	if (data->loading_fw) {
