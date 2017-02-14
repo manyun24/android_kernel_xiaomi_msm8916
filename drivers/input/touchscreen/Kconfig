@@ -1112,7 +1112,6 @@ config TOUCHSCREEN_IT7260_I2C
 	  module will be called it7258_ts_i2c.
 
 config TOUCHSCREEN_DOUBLETAP2WAKE
-	bool "wake gestures"
 	tristate "DoubleTap2Wake for touchscreens"
 	select TOUCHSCREEN_PREVENT_SLEEP
 	default n
