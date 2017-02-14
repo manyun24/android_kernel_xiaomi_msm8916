@@ -35,16 +35,9 @@
 #include <linux/hrtimer.h>
 #include <asm-generic/cputime.h>
 
-/* Make sure, that only one variant of LTR559/553 along with Ondemand sensor is
- * enabled
- */
 #ifdef CONFIG_PSENSOR_ONDEMAND_STATE
 #include <linux/input/ltr559.h>
 extern int ltr559_ps_ondemand_state (void);
-#endif
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-#include <linux/input/ltr553.h>
-extern int ltr553_ps_ondemand_state (void);
 #endif
 
 /* uncomment since no touchscreen defines android touch, do that here */
@@ -69,7 +62,7 @@ MODULE_LICENSE("GPLv2");
 /* Tuneables */
 #define DT2W_DEFAULT		0
 
-#define DT2W_PWRKEY_DUR		200
+#define DT2W_PWRKEY_DUR		60
 #define DT2W_TIME		700
 
 #define DT2W_OFF 0
@@ -83,9 +76,6 @@ int dt2w_sent_play_pause = 0;
 int dt2w_feather = 200, dt2w_feather_w = 1;
 #ifdef CONFIG_PSENSOR_ONDEMAND_STATE
 int dtw2_psensor_state = LTR559_ON_DEMAND_RESET;
-#endif
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-int dtw2_psensor_state = LTR553_ON_DEMAND_RESET;
 #endif
 static cputime64_t tap_time_pre = 0;
 static int touch_x = 0, touch_y = 0, touch_nr = 0, x_pre = 0, y_pre = 0;
@@ -151,17 +141,6 @@ static void doubletap2wake_presspwr(struct work_struct * doubletap2wake_presspwr
 	DT2W_PRINFO("%s:%d -Proximity Sensor is not covered, dt2w can wakeup device\n",
 		__func__, __LINE__);
 #endif
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-	if (dtw2_psensor_state == LTR553_ON_DEMAND_COVERED) {
-	    DT2W_PRINFO("%s:%d -Proximity Sensor is covered, dt2w is ignored\n",
-		    __func__, __LINE__);
-		dtw2_psensor_state = LTR553_ON_DEMAND_RESET;
-		return;
-	}
-	dtw2_psensor_state = LTR553_ON_DEMAND_RESET;
-	DT2W_PRINFO("%s:%d -Proximity Sensor is not covered, dt2w can wakeup device\n",
-		__func__, __LINE__);
-#endif
 
 	if (!mutex_trylock(&pwrkeyworklock))
                 return;
@@ -186,15 +165,6 @@ static void doubletap2wake_pwrtrigger(void) {
 	 * dt2w is actually performed.
 	 */
 	dtw2_psensor_state = ltr559_ps_ondemand_state();
-#endif
-#ifdef CONFIG_PSENSOR_ONDEMAND_LTR553
-	/*
-	 * Prema Chand Alugu (premaca@gmail.com)
-	 * check the proximity sensor on demand.
-	 * The returned state should be checked when the
-	 * dt2w is actually performed.
-	 */
-	dtw2_psensor_state = ltr553_ps_ondemand_state();
 #endif
 	schedule_work(&doubletap2wake_presspwr_work);
         return;
@@ -272,11 +242,11 @@ static void dt2w_input_callback(struct work_struct *unused) {
 
 static void dt2w_input_event(struct input_handle *handle, unsigned int type,
 				unsigned int code, int value) {
-	DT2W_PRINFO("doubletap2wake: code: %s|%u, val: %i\n",
+/*	DT2W_PRINFO("doubletap2wake: code: %s|%u, val: %i\n",
 		((code==ABS_MT_POSITION_X) ? "X" :
 		(code==ABS_MT_POSITION_Y) ? "Y" :
 		(code==ABS_MT_TRACKING_ID) ? "ID" :
-		"undef"), code, value);
+		"undef"), code, value);*/
 	if (in_phone_call)
 		return;
 
@@ -284,16 +254,7 @@ static void dt2w_input_event(struct input_handle *handle, unsigned int type,
 		return;
 
 	if (code == ABS_MT_SLOT) {
-		/* We did not handle EV_SYN event gracefully before we change
-		 * the SLOT. However we are simply resetting the touch count
-		 * here which results the loss of the previous touch. Then we
-		 * need two more touches for dt2w.
-		 * So, let us not reset the touch as EV_SYN is not handled
-		 * and considered gracefully. This we do only if we have already
-		 * recognized one touch, Too much description, Huh...
-		 */
-		if (!touch_nr)
-		    doubletap2wake_reset();
+		doubletap2wake_reset();
 		return;
 	}
 
@@ -323,7 +284,8 @@ static void dt2w_input_event(struct input_handle *handle, unsigned int type,
 
 static int input_dev_filter(struct input_dev *dev) {
 	if (strstr(dev->name, "touch") ||
-	    strstr(dev->name, "ft5x06")) {
+	    strstr(dev->name, "ft5x06") ||
+	    strstr(dev->name, "ist30xx_ts")) {
 		return 0;
 	} else {
 		return 1;
